@@ -17,6 +17,15 @@ const RAINDROP_FRAG_SRC: &str = include_str!("../shaders/raindrop.frag.glsl");
 const SYMBOL_FRAG_SRC: &str = include_str!("../shaders/symbol.frag.glsl");
 const EFFECT_FRAG_SRC: &str = include_str!("../shaders/effect.frag.glsl");
 
+/// Real-time duration one logical `tick` represents, in seconds. Matches
+/// the original Rezmason/matrix source's assumption (`js/config.js`'s
+/// `fps: 60` default, `js/regl/main.js`'s
+/// `targetFrameTimeMilliseconds = 1000 / config.fps` gating): the
+/// `cycle_frame_skip` preset values were tuned assuming 1 tick ≈ 1/60
+/// second, independent of the host app's own repaint-request cadence
+/// (an unrelated CPU/GPU-load concern).
+const NOMINAL_TICK_SECS: f32 = 1.0 / 60.0;
+
 struct IntroUniforms {
     previous_intro_state: Option<glow::UniformLocation>,
     num_columns: Option<glow::UniformLocation>,
@@ -98,6 +107,11 @@ pub struct ComputePasses {
     num_columns: u32,
     num_rows: u32,
     tick: u32,
+    /// The `time` value (see `run`'s `time` param — cumulative, unscaled,
+    /// wall-clock-derived seconds) as of the last time `tick` advanced.
+    /// Used to bin real elapsed time into logical ticks instead of
+    /// advancing once per `run()` call — see `advance_tick`.
+    last_tick_time: f32,
 }
 
 impl ComputePasses {
@@ -238,6 +252,7 @@ impl ComputePasses {
                 num_columns,
                 num_rows,
                 tick: 0,
+                last_tick_time: 0.0,
             })
         }
     }
@@ -294,9 +309,29 @@ impl ComputePasses {
     /// `symbol_state()`, and `effect_state()` are valid to sample
     /// (reflecting this frame's freshly computed state) immediately after
     /// this returns, until the next call to `run`.
+    ///
+    /// This is a no-op (no draws, no ping-pong swaps, no state mutation —
+    /// `raindrop_state()` etc. keep returning whatever they returned last
+    /// time) if no new logical tick has elapsed since the previous call to
+    /// `run`. This matters because `cycle_frame_skip == 1` (the default)
+    /// makes `symbol.frag.glsl`'s `mod(tick, cycleFrameSkip) == 0.` gate a
+    /// no-op — it's always true — so without this early return, calling
+    /// `run` more often than the nominal tick rate (e.g. extra repaints
+    /// `eframe` forces on mouse movement) would advance the glyph-cycling
+    /// `age` accumulator once per *call* rather than once per elapsed
+    /// tick, exactly the bug this whole tick-pacing mechanism exists to
+    /// prevent. Skipping only this pass (not the render/bloom/effect
+    /// passes downstream, which still redraw every call) avoids a missing-
+    /// frame flicker, since unlike the original's persistent browser
+    /// canvas, egui repaints the whole window every call and expects a
+    /// fresh frame back.
     pub unsafe fn run(&mut self, gl: &glow::Context, config: &MatrixConfig, time: f32) {
         unsafe {
-            self.tick += 1;
+            let previous_tick = self.tick;
+            (self.tick, self.last_tick_time) = advance_tick(self.tick, self.last_tick_time, time);
+            if self.tick == previous_tick {
+                return;
+            }
             let tick = self.tick as f32;
             let num_columns = self.num_columns as f32;
             let num_rows = self.num_rows as f32;
@@ -472,5 +507,76 @@ impl ComputePasses {
             gl.delete_program(self.symbol_program);
             gl.delete_program(self.effect_program);
         }
+    }
+}
+
+/// Given the current tick counter and the `time` value as of the last tick
+/// advancement, plus this call's `time`, returns the updated
+/// `(tick, last_tick_time)`. Advances `tick` by however many
+/// `NOMINAL_TICK_SECS`-sized chunks of real elapsed time have accumulated
+/// since the last advancement (0 for a burst of near-zero-dt extra calls,
+/// 1 for steady nominal-rate calls, more than 1 to catch up after a
+/// stall/lag spike) instead of once per call. This keeps glyph-cycling
+/// (gated on `tick` in `symbol.frag.glsl`) paced by real time rather than
+/// by how many times `run()` happens to be invoked — some hosts (e.g.
+/// `eframe`'s native backend) force extra repaints on input events like
+/// mouse movement, which would otherwise make `tick`-gated animation speed
+/// up during those bursts.
+fn advance_tick(tick: u32, last_tick_time: f32, time: f32) -> (u32, f32) {
+    if tick == 0 {
+        // First call ever: seed tick at 1 unconditionally so `isFirstFrame`
+        // (`tick <= 1.` in raindrop.frag.glsl / symbol.frag.glsl) still
+        // fires on the true first frame.
+        return (1, time);
+    }
+    let elapsed = (time - last_tick_time).max(0.0);
+    // `+ 1e-4` guards against float rounding landing just under an exact
+    // tick boundary (e.g. `10.0 * NOMINAL_TICK_SECS / NOMINAL_TICK_SECS`
+    // can evaluate to `9.999999` in f32), which would otherwise undercount
+    // by one tick.
+    let ticks_elapsed = (elapsed / NOMINAL_TICK_SECS + 1e-4).floor() as u32;
+    if ticks_elapsed == 0 {
+        return (tick, last_tick_time);
+    }
+    (
+        tick + ticks_elapsed,
+        last_tick_time + ticks_elapsed as f32 * NOMINAL_TICK_SECS,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_call_seeds_tick_to_one() {
+        assert_eq!(advance_tick(0, 0.0, 0.0), (1, 0.0));
+    }
+
+    #[test]
+    fn burst_of_near_zero_dt_calls_does_not_advance_tick() {
+        let (tick, last) = advance_tick(1, 0.0, 0.0);
+        // Several extra calls, each with a tiny real dt (e.g. mouse-move
+        // forced repaints), none individually crossing NOMINAL_TICK_SECS.
+        let (tick, last) = advance_tick(tick, last, 0.001);
+        let (tick, last) = advance_tick(tick, last, 0.002);
+        let (tick, _last) = advance_tick(tick, last, 0.003);
+        assert_eq!(tick, 1);
+    }
+
+    #[test]
+    fn steady_nominal_rate_advances_by_one_each_call() {
+        let (mut tick, mut last) = (1u32, 0.0f32);
+        for i in 1..=10 {
+            (tick, last) = advance_tick(tick, last, i as f32 * NOMINAL_TICK_SECS);
+        }
+        assert_eq!(tick, 11);
+    }
+
+    #[test]
+    fn stall_catches_up_by_more_than_one() {
+        let (tick, last) = advance_tick(5, 1.0, 1.0 + 10.0 * NOMINAL_TICK_SECS);
+        assert_eq!(tick, 15);
+        assert_eq!(last, 1.0 + 10.0 * NOMINAL_TICK_SECS);
     }
 }

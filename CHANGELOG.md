@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-07-05
+
+### Fixed
+
+- Glyph-cycling and brightness-decay simulation state advanced once per
+  call to the paint callback instead of once per elapsed simulation tick,
+  making the rain's pacing speed up whenever the host forced extra
+  repaints (e.g. `eframe`'s native backend does this on every mouse-move
+  event). The compute pass now tracks elapsed wall-clock time and skips
+  its state-mutating work entirely on calls where no new tick has
+  elapsed, matching the original's `shouldRender`-gated pipeline
+  stepping.
+
 ## [0.1.0] - 2026-07-05
 
 ### Added
@@ -25,5 +38,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   base/glint textures.
 - Native and web (WASM) demo examples.
 
-[Unreleased]: https://github.com/cecton/egui-screensaver-matrix/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/cecton/egui-screensaver-matrix/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/cecton/egui-screensaver-matrix/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/cecton/egui-screensaver-matrix/releases/tag/v0.1.0
