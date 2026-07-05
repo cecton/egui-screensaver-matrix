@@ -20,6 +20,11 @@ uniform sampler2D previousSymbolState, raindropState;
 uniform float numColumns, numRows;
 uniform float time, tick, cycleFrameSkip;
 uniform float animationSpeed, cycleSpeed;
+// How many times this gate would have fired had ticks advanced one at a
+// time instead of being batched (see the Rust-side `count_gate_events` in
+// `passes/compute.rs`), so the age increment stays correct in real time
+// even when a call represents more than one elapsed logical tick.
+uniform float gateEventCount;
 uniform bool loops;
 uniform float glyphSequenceLength;
 
@@ -43,12 +48,16 @@ vec4 computeResult(float simTime, bool isFirstFrame, vec2 screenPos, vec4 previo
     float localCycleSpeed = animationSpeed * cycleSpeed;
     float age = previousAge;
     float symbol = previousSymbol;
-    if (mod(tick, cycleFrameSkip) == 0.) {
-        age += localCycleSpeed * cycleFrameSkip;
-        if (age >= 1.) {
-            symbol = floor(glyphSequenceLength * randomFloat(screenPos + simTime));
-            age = fract(age);
-        }
+    // `age` always stays in [0, 1) on entry (via `fract()` below or the
+    // reset path above), so adding `gateEventCount` gate-events' worth of
+    // increment in one shot and checking the threshold once is exactly
+    // equivalent to applying a single gate-event's increment
+    // `gateEventCount` times in a row — no loop needed. When
+    // `gateEventCount` is 0 (no gate crossed this call), this is a no-op.
+    age += localCycleSpeed * cycleFrameSkip * gateEventCount;
+    if (age >= 1.) {
+        symbol = floor(glyphSequenceLength * randomFloat(screenPos + simTime));
+        age = fract(age);
     }
 
     return vec4(symbol, age, 0., 0.);

@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-07-05
+
+### Fixed
+
+- Individual glyphs no longer cycled to a new character independently;
+  the whole screen visibly changed characters in synchronized waves
+  instead. Caused by a rate mismatch introduced by the 0.1.1 fix: the
+  simulation's tick rate (60fps, matching the original) was batching
+  roughly 2 logical ticks into every rendered frame, since this port
+  only repaints at ~30fps — collapsing each cell's independent
+  phase-based desync into a single, simultaneous mass reassignment every
+  frame. The simulation's nominal tick rate now matches this port's
+  actual render cadence (30fps) instead of the original's 60fps, so each
+  rendered frame represents at most one logical tick again, at the cost
+  of running roughly half as fast, absolute-speed-wise, as the original.
+
 ## [0.1.1] - 2026-07-05
 
 ### Fixed
@@ -38,6 +54,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   base/glint textures.
 - Native and web (WASM) demo examples.
 
-[Unreleased]: https://github.com/cecton/egui-screensaver-matrix/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/cecton/egui-screensaver-matrix/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/cecton/egui-screensaver-matrix/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/cecton/egui-screensaver-matrix/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/cecton/egui-screensaver-matrix/releases/tag/v0.1.0

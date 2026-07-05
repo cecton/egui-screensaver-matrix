@@ -17,14 +17,21 @@ const RAINDROP_FRAG_SRC: &str = include_str!("../shaders/raindrop.frag.glsl");
 const SYMBOL_FRAG_SRC: &str = include_str!("../shaders/symbol.frag.glsl");
 const EFFECT_FRAG_SRC: &str = include_str!("../shaders/effect.frag.glsl");
 
-/// Real-time duration one logical `tick` represents, in seconds. Matches
-/// the original Rezmason/matrix source's assumption (`js/config.js`'s
-/// `fps: 60` default, `js/regl/main.js`'s
-/// `targetFrameTimeMilliseconds = 1000 / config.fps` gating): the
-/// `cycle_frame_skip` preset values were tuned assuming 1 tick ≈ 1/60
-/// second, independent of the host app's own repaint-request cadence
-/// (an unrelated CPU/GPU-load concern).
-const NOMINAL_TICK_SECS: f32 = 1.0 / 60.0;
+/// Real-time duration one logical `tick` represents, in seconds. Must
+/// match `MatrixBackground`'s own repaint-request cadence
+/// (`REPAINT_MS` in `lib.rs`, currently 33ms i.e. ~30fps) rather than the
+/// original Rezmason/matrix source's 60fps assumption
+/// (`js/config.js`'s `fps: 60`): under normal conditions, each rendered
+/// frame must represent at most one logical tick, or `symbol.frag.glsl`'s
+/// per-cell phase-based desync (each cell's own `previousAge` spreads out
+/// *when* it crosses the glyph-cycling threshold) collapses into a
+/// synchronized mass reassignment whenever more than one tick's worth of
+/// crossings get batched into a single visible frame. Since this port's
+/// render rate is throttled below the original's 60fps, matching the
+/// *render* cadence here (rather than the original's tick cadence) is
+/// what keeps individual glyphs cycling independently — at the cost of
+/// running roughly half as fast, absolute-speed-wise, as the original.
+const NOMINAL_TICK_SECS: f32 = 1.0 / 30.0;
 
 struct IntroUniforms {
     previous_intro_state: Option<glow::UniformLocation>,
@@ -64,6 +71,10 @@ struct SymbolUniforms {
     cycle_speed: Option<glow::UniformLocation>,
     loops: Option<glow::UniformLocation>,
     glyph_sequence_length: Option<glow::UniformLocation>,
+    /// See `count_gate_events` — how many times the glyph-cycling gate
+    /// would have fired had ticks been advanced one at a time instead of
+    /// batched, since the last call to `run`.
+    gate_event_count: Option<glow::UniformLocation>,
 }
 
 struct EffectUniforms {
@@ -187,6 +198,7 @@ impl ComputePasses {
                 loops: gl.get_uniform_location(symbol_program, "loops"),
                 glyph_sequence_length: gl
                     .get_uniform_location(symbol_program, "glyphSequenceLength"),
+                gate_event_count: gl.get_uniform_location(symbol_program, "gateEventCount"),
             };
             // `glyphSequenceLength` depends only on the font, not on any
             // per-frame state, so it's set once here rather than every
@@ -332,6 +344,19 @@ impl ComputePasses {
             if self.tick == previous_tick {
                 return;
             }
+            let ticks_elapsed = self.tick - previous_tick;
+            let gate_event_count =
+                count_gate_events(previous_tick, self.tick, config.cycle_frame_skip) as f32;
+            // `mix(prev, target, decay)` applied once per elapsed tick, N
+            // times in a row, is equivalent to a single
+            // `mix(prev, target, 1 - (1-decay)^N)` (holding the target
+            // constant across the batch — see `count_gate_events`'s doc
+            // comment for the analogous reasoning behind batching ticks in
+            // the first place). This keeps `brightness_decay`'s organic
+            // fade rate correct even when `ticks_elapsed > 1`, without
+            // needing a shader-side loop.
+            let effective_brightness_decay =
+                1.0 - (1.0 - config.brightness_decay).powi(ticks_elapsed as i32);
             let tick = self.tick as f32;
             let num_columns = self.num_columns as f32;
             let num_rows = self.num_rows as f32;
@@ -397,7 +422,7 @@ impl ComputePasses {
             );
             gl.uniform_1_f32(
                 self.raindrop_uniforms.brightness_decay.as_ref(),
-                config.brightness_decay,
+                effective_brightness_decay,
             );
             gl.uniform_1_f32(
                 self.raindrop_uniforms.raindrop_length.as_ref(),
@@ -422,6 +447,10 @@ impl ComputePasses {
             gl.uniform_1_f32(
                 self.symbol_uniforms.cycle_frame_skip.as_ref(),
                 config.cycle_frame_skip as f32,
+            );
+            gl.uniform_1_f32(
+                self.symbol_uniforms.gate_event_count.as_ref(),
+                gate_event_count,
             );
             gl.uniform_1_f32(
                 self.symbol_uniforms.animation_speed.as_ref(),
@@ -544,6 +573,20 @@ fn advance_tick(tick: u32, last_tick_time: f32, time: f32) -> (u32, f32) {
     )
 }
 
+/// Counts how many multiples of `cycle_frame_skip` lie in
+/// `(previous_tick, tick]` — i.e. how many times `symbol.frag.glsl`'s
+/// glyph-cycling gate would have fired had ticks advanced one at a time
+/// instead of being batched by `advance_tick`. Uses the standard "count
+/// multiples of k up to n" identity (`floor(n/k) - floor(m/k)`), so it
+/// naturally handles more than one crossing (e.g. after a long stall)
+/// without a loop. `cycle_frame_skip` is clamped to a minimum of 1 to
+/// avoid dividing by zero should a corrupt/legacy config on disk have
+/// `cycle_frame_skip == 0`.
+fn count_gate_events(previous_tick: u32, tick: u32, cycle_frame_skip: u32) -> u32 {
+    let skip = cycle_frame_skip.max(1);
+    tick / skip - previous_tick / skip
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -578,5 +621,54 @@ mod tests {
         let (tick, last) = advance_tick(5, 1.0, 1.0 + 10.0 * NOMINAL_TICK_SECS);
         assert_eq!(tick, 15);
         assert_eq!(last, 1.0 + 10.0 * NOMINAL_TICK_SECS);
+    }
+
+    #[test]
+    fn gate_events_fire_every_tick_when_skip_is_one() {
+        assert_eq!(count_gate_events(4, 5, 1), 1);
+        assert_eq!(count_gate_events(4, 6, 1), 2); // a batched jump of 2 ticks
+    }
+
+    #[test]
+    fn gate_events_detect_crossed_multiple_mid_batch() {
+        // jump from tick 7 to tick 9 with skip 8: crosses the multiple at 8.
+        assert_eq!(count_gate_events(7, 9, 8), 1);
+    }
+
+    #[test]
+    fn gate_events_zero_when_no_multiple_crossed() {
+        // jump from tick 0 to tick 2 with skip 3: no multiple of 3 in (0, 2].
+        assert_eq!(count_gate_events(0, 2, 3), 0);
+    }
+
+    #[test]
+    fn gate_events_count_multiple_crossings_after_a_stall() {
+        // jump from tick 1 to tick 20 with skip 8: crosses 8 and 16.
+        assert_eq!(count_gate_events(1, 20, 8), 2);
+    }
+
+    #[test]
+    fn gate_events_treat_zero_skip_as_one_to_avoid_div_by_zero() {
+        assert_eq!(count_gate_events(4, 6, 0), 2);
+    }
+
+    #[test]
+    fn effective_decay_is_unchanged_for_single_tick() {
+        let effective = 1.0 - (1.0f32 - 0.75).powi(1);
+        assert!((effective - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn effective_decay_is_identity_at_decay_one() {
+        assert_eq!(1.0 - (1.0f32 - 1.0).powi(2), 1.0);
+        assert_eq!(1.0 - (1.0f32 - 1.0).powi(1), 1.0);
+    }
+
+    #[test]
+    fn effective_decay_compounds_for_two_ticks() {
+        // mix applied twice with decay=0.75 in a row is equivalent to a
+        // single mix with 1-(1-0.75)^2 = 0.9375.
+        let effective = 1.0 - (1.0f32 - 0.75).powi(2);
+        assert!((effective - 0.9375).abs() < 1e-6);
     }
 }
