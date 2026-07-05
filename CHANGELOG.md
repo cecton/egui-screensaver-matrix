@@ -7,14 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-07-05
+
 ### Added
 
-- Initial in-progress port of [Rezmason's Matrix](https://github.com/Rezmason/matrix)
-  digital rain screensaver for egui.
-- GPU-rendered ping-pong compute passes (intro reveal, raindrop fall/decay,
-  glyph cycling, ripple/thunder effects) and a single-font 2D MSDF glyph
-  render pass, via `egui::PaintCallback`/`egui_glow`.
+- Initial release: a GPU-shader port of
+  [Rezmason's Matrix](https://github.com/Rezmason/matrix) digital rain
+  screensaver for egui.
+- Full rain simulation via ping-pong compute passes (intro reveal,
+  raindrop fall/decay, glyph cycling, ripple/thunder effects) and MSDF
+  glyph rendering, via `egui::PaintCallback`/`egui_glow`.
+- A 5-level bloom pyramid (highpass + separable blur + combine).
+- Palette-gradient, custom-stripes, pride, and trans color effects.
+- All 8 bundled fonts and all 13 named presets from the original,
+  including the 4 volumetric (3D perspective) presets, with a
+  hand-rolled camera matrix, glint-MSDF highlights, and decorative
+  base/glint textures.
 - Native and web (WASM) demo examples.
 
-Not yet implemented: bloom, palette/stripe/pride/trans color effects,
-additional fonts, volumetric 3D mode.
+[Unreleased]: https://github.com/cecton/egui-screensaver-matrix/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/cecton/egui-screensaver-matrix/releases/tag/v0.1.0

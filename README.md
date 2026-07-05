@@ -14,13 +14,11 @@ original.
 
 Like the original, this runs the whole simulation on the GPU: ping-pong
 "compute" render targets drive the falling-glyph animation, an MSDF font
-atlas renders the glyphs, and (from a later version onward) a bloom pass and
+atlas renders the glyphs, and a bloom pass plus a palette/stripe/pride/trans
 color-effect pass finish the look — all through an [`egui::PaintCallback`]
 via [`egui_glow`]. This means the host `eframe::App` must use the `glow`
-rendering backend (not `wgpu`).
-
-> **Status:** early/incomplete. This crate is being built up in stages;
-> see `CHANGELOG.md` for what's currently implemented.
+rendering backend (not `wgpu`). All 13 named presets from the original are
+included, plus the 4 volumetric (3D perspective) presets.
 
 ## Usage
 
