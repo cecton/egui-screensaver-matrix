@@ -20,6 +20,29 @@ via [`egui_glow`]. This means the host `eframe::App` must use the `glow`
 rendering backend (not `wgpu`). All 13 named presets from the original are
 included, plus the 4 volumetric (3D perspective) presets.
 
+## Demo
+
+The [live demo](https://cecton.github.io/egui-screensaver-matrix/) accepts
+`?preset=` and `&effect=` query parameters to jump straight to a variant:
+
+| Name | URL |
+|------|-----|
+| Classic | https://cecton.github.io/egui-screensaver-matrix/ |
+| Megacity | https://cecton.github.io/egui-screensaver-matrix/?preset=megacity |
+| Neomatrixology | https://cecton.github.io/egui-screensaver-matrix/?preset=neomatrixology |
+| Operator | https://cecton.github.io/egui-screensaver-matrix/?preset=operator |
+| Nightmare | https://cecton.github.io/egui-screensaver-matrix/?preset=nightmare |
+| Paradise | https://cecton.github.io/egui-screensaver-matrix/?preset=paradise |
+| Resurrections | https://cecton.github.io/egui-screensaver-matrix/?preset=resurrections |
+| Palimpsest | https://cecton.github.io/egui-screensaver-matrix/?preset=palimpsest |
+| Twilight | https://cecton.github.io/egui-screensaver-matrix/?preset=twilight |
+| Trinity (volumetric) | https://cecton.github.io/egui-screensaver-matrix/?preset=trinity |
+| Morpheus (volumetric) | https://cecton.github.io/egui-screensaver-matrix/?preset=morpheus |
+| Bugs (volumetric) | https://cecton.github.io/egui-screensaver-matrix/?preset=bugs |
+| 3D (volumetric) | https://cecton.github.io/egui-screensaver-matrix/?preset=3d |
+| Pride flag colors | https://cecton.github.io/egui-screensaver-matrix/?effect=pride |
+| Trans flag colors | https://cecton.github.io/egui-screensaver-matrix/?effect=trans |
+
 ## Usage
 
 Add the crate to your `Cargo.toml`:
