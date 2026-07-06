@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-07-05
+
+### Fixed
+
+- Switching presets/fonts at runtime (e.g. Megacity → Operator → back to
+  Megacity) left most on-screen glyphs showing near-identical characters
+  clustered in one corner of the font atlas, instead of the usual varied
+  mix. Each cell's stored glyph index was generated against the
+  *previous* font's `glyphSequenceLength` range and never invalidated on
+  a font switch, so old (possibly much smaller-range) indices got
+  reinterpreted against the new atlas's larger grid, landing in its
+  low-index corner until each cell happened to cycle again on its own.
+  The compute pass now resets on any font switch (and, for the same
+  underlying reason, on any grid resize) so every cell immediately
+  re-rolls its glyph against whatever font/atlas is currently active.
+
 ## [0.1.2] - 2026-07-05
 
 ### Fixed
@@ -54,7 +70,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   base/glint textures.
 - Native and web (WASM) demo examples.
 
-[Unreleased]: https://github.com/cecton/egui-screensaver-matrix/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/cecton/egui-screensaver-matrix/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/cecton/egui-screensaver-matrix/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/cecton/egui-screensaver-matrix/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/cecton/egui-screensaver-matrix/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/cecton/egui-screensaver-matrix/releases/tag/v0.1.0

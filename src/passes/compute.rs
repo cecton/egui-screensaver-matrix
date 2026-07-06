@@ -285,6 +285,24 @@ impl ComputePasses {
         }
     }
 
+    /// Resets the tick counter, forcing every cell through the
+    /// `isFirstFrame`/`resetGlyph` path on the next `run()` — cheaply
+    /// re-rolling each cell's stored `symbol` index fresh against
+    /// whatever `glyphSequenceLength` is current. Must be called whenever
+    /// a change makes the previously-stored per-cell `symbol_buf` state
+    /// stale: switching to a font with a different `glyphSequenceLength`
+    /// (see `passes/mod.rs`'s font-switch branch) reuses the ping-pong
+    /// buffer's old indices, which were only ever drawn from the
+    /// *previous* font's (possibly much smaller) range — reinterpreted
+    /// against a larger atlas, those stale low-value indices all land in
+    /// the same narrow corner of the new grid, showing as a mass of
+    /// near-identical glyphs until each cell happens to cycle again on its
+    /// own schedule.
+    pub fn reset_tick(&mut self) {
+        self.tick = 0;
+        self.last_tick_time = 0.0;
+    }
+
     /// Recreates the compute buffers if the grid resolution changed
     /// (driven by `num_columns` and, in volumetric mode, `density` — see
     /// `passes/mod.rs` — non-volumetric mode always has `num_rows ==
@@ -312,6 +330,15 @@ impl ComputePasses {
                 .resize(gl, num_columns as i32, num_rows as i32)?;
             self.num_columns = num_columns;
             self.num_rows = num_rows;
+            // The freshly (re)created buffers above start blank (every
+            // cell's `previousAge`/`previousSymbol` reads back as 0)
+            // rather than through the proper per-cell random reset path,
+            // which only fires when `isFirstFrame` is true — without this,
+            // every cell would start in lockstep (same age, same symbol)
+            // instead of independently phased. See `reset_tick`'s doc
+            // comment for the same underlying "stale/invalid state must
+            // trigger a reset" reasoning.
+            self.reset_tick();
             Ok(())
         }
     }

@@ -117,6 +117,13 @@ impl Passes {
                 } else {
                     self.compute
                         .set_glyph_sequence_length(gl, font.glyph_sequence_length);
+                    // Cells' stored `symbol` indices were drawn from the
+                    // *old* font's glyphSequenceLength range; reinterpreted
+                    // against the new (possibly larger) atlas they'd all
+                    // cluster into its low-index corner until each cell
+                    // happens to cycle again on its own. Force everyone to
+                    // re-roll now instead. See `reset_tick`'s doc comment.
+                    self.compute.reset_tick();
                     self.current_font = config.font;
                 }
             }
