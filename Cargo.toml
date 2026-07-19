@@ -1,6 +1,6 @@
 [package]
 name = "egui-screensaver-matrix"
-version = "0.1.3"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 authors = ["Cecile Tonglet <cecile.tonglet@cecton.com>"]
@@ -14,8 +14,8 @@ keywords = ["egui", "screensaver", "matrix", "animation", "wasm"]
 categories = ["gui", "graphics", "wasm", "visualization"]
 
 [dependencies]
-egui = { version = "0.34", default-features = false }
-egui_glow = "0.34"
+egui = { version = "0.35", default-features = false }
+egui_glow = "0.35"
 glow = "0.17"
 log = "0.4"
 image = { version = "0.25", default-features = false, features = ["png"] }
@@ -28,13 +28,13 @@ serde = ["dep:serde"]
 xtask-wasm = { version = "0.6.5", features = ["run-example", "wasm-opt"] }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
-eframe = { version = "0.34", default-features = false, features = ["glow", "default_fonts", "web_screen_reader", "accesskit"] }
+eframe = { version = "0.35", default-features = false, features = ["glow", "default_fonts", "web_screen_reader", "accesskit"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = ["HtmlCanvasElement", "Location", "UrlSearchParams", "Window"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-eframe = { version = "0.34", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+eframe = { version = "0.35", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
 
 [workspace]
 members = ["."]
