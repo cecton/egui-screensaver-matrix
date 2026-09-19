@@ -14,6 +14,14 @@
 #endif
 #ifdef GL_ES
 precision lowp float;
+// Declared in both stages of the render program (the vertex shader uses it
+// to shear glyph quads in volumetric mode). Vertex-shader floats default to
+// `highp`, so under the `lowp` default below Firefox's strict ES linker
+// rejects the program with "Uniform glyphHeightToWidth is not linkable
+// between shaders" — match the vertex stage's precision explicitly.
+uniform highp float glyphHeightToWidth;
+#else
+uniform float glyphHeightToWidth;
 #endif
 
 #if NEW_SHADER_INTERFACE
@@ -42,7 +50,7 @@ uniform sampler2D baseTexture, glintTexture;
 uniform bool hasBaseTexture, hasGlintTexture;
 uniform float msdfPxRange;
 uniform vec2 glyphMSDFSize, glintMSDFSize;
-uniform float glyphHeightToWidth, glyphSequenceLength, glyphEdgeCrop;
+uniform float glyphSequenceLength, glyphEdgeCrop;
 uniform float baseContrast, baseBrightness, glintContrast, glintBrightness;
 uniform float brightnessOverride, brightnessThreshold;
 uniform vec2 glyphTextureGridSize;
