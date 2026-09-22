@@ -1,10 +1,17 @@
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result {
-    use egui_screensaver_matrix::MatrixBackground;
+    use egui_screensaver_matrix::{MatrixBackground, MatrixConfig};
 
-    #[derive(Default)]
     struct App {
         matrix: MatrixBackground,
+    }
+
+    impl Default for App {
+        fn default() -> Self {
+            Self {
+                matrix: MatrixBackground::new(MatrixConfig::default()),
+            }
+        }
     }
 
     impl eframe::App for App {

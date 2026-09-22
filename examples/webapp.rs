@@ -208,10 +208,8 @@ fn run_app() {
                     canvas,
                     web_options,
                     Box::new(|_cc| {
-                        let mut screensaver = MatrixBackground::default();
-                        screensaver.config = config_from_query();
                         Ok(Box::new(DemoApp {
-                            screensaver,
+                            screensaver: MatrixBackground::new(config_from_query()),
                             logged_first_frame: false,
                         }))
                     }),

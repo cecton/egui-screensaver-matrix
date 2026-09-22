@@ -83,18 +83,17 @@ impl Drop for PassesHandle {
     }
 }
 
-impl Default for MatrixBackground {
-    fn default() -> Self {
+impl MatrixBackground {
+    /// Create a new matrix state with the given configuration.
+    pub fn new(config: MatrixConfig) -> Self {
         Self {
-            config: MatrixConfig::default(),
+            config,
             time: 0.0,
             last_time: None,
             passes: None,
         }
     }
-}
 
-impl MatrixBackground {
     /// Paint the screensaver onto the egui background layer for this frame.
     ///
     /// Call this once per frame **before** drawing any UI panels or windows
