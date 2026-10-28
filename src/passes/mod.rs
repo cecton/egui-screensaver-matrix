@@ -3,13 +3,11 @@ pub mod compute;
 pub mod effect;
 pub mod render;
 
-use std::sync::Arc;
-
-use glow::HasContext as _;
+use egui_wgpu::wgpu;
 
 use crate::config::MatrixConfig;
 use crate::fonts::FontId;
-use crate::gl_util::{RenderTarget, TargetFilter, TargetFormat};
+use crate::gpu::{RenderTarget, Samplers, TargetFormat};
 use bloom::BloomPasses;
 use compute::ComputePasses;
 use effect::EffectPasses;
@@ -30,16 +28,15 @@ fn grid_dimensions(config: &MatrixConfig) -> (u32, u32) {
     }
 }
 
-/// Owns every GPU resource for one frame's worth of work: the 4 ping-pong
-/// compute passes, the main glyph-render pass (into an offscreen primary
-/// target), the bloom pass, and the final palette/stripe effect pass.
-/// `run` executes the full per-frame sequence, leaving the final image
-/// drawn into whatever framebuffer is bound when it's called (the caller
-/// — [`crate::MatrixBackground`] — is responsible for making sure that's
-/// the right target, since this crate has no portable way to query/
-/// restore an arbitrary previous framebuffer binding across the native/
-/// WebGL backends; see `lib.rs`).
+/// Owns every GPU resource for one frame's worth of work: the compute
+/// passes, the main glyph-render pass (into an offscreen primary target),
+/// the bloom pass, and the final palette/stripe effect pass.
+///
+/// A frame runs in two halves: [`Passes::prepare`] records every offscreen
+/// pass into the encoder egui hands to `CallbackTrait::prepare`, and
+/// [`Passes::paint`] draws the final composite into egui's render pass.
 pub struct Passes {
+    samplers: Samplers,
     compute: ComputePasses,
     render: RenderPass,
     bloom: BloomPasses,
@@ -48,141 +45,150 @@ pub struct Passes {
     grid_columns: u32,
     grid_rows: u32,
     current_font: FontId,
-    screen_width: i32,
-    screen_height: i32,
+    screen_width: u32,
+    screen_height: u32,
     bloom_size: f32,
 }
 
 impl Passes {
-    pub unsafe fn new(
-        gl: &Arc<glow::Context>,
+    pub fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        target_format: wgpu::TextureFormat,
         config: &MatrixConfig,
-        screen_width: i32,
-        screen_height: i32,
+        screen_width: u32,
+        screen_height: u32,
     ) -> Result<Self, String> {
-        unsafe {
-            let header = crate::gl_util::shader_header(gl);
-            let font = config.font.atlas();
-            let (grid_columns, grid_rows) = grid_dimensions(config);
-            let compute = ComputePasses::new(gl, &header, grid_columns, grid_rows, font)?;
-            let render = RenderPass::new(gl, &header, font)?;
-            let bloom =
-                BloomPasses::new(gl, &header, screen_width, screen_height, config.bloom_size)?;
-            let effect = EffectPasses::new(gl, &header, config)?;
-            let primary = RenderTarget::new(
-                gl,
-                screen_width,
-                screen_height,
-                TargetFormat::Rgba8,
-                TargetFilter::Linear,
-            )?;
-            Ok(Self {
-                compute,
-                render,
-                bloom,
-                effect,
-                primary,
-                grid_columns,
-                grid_rows,
-                current_font: config.font,
-                screen_width,
-                screen_height,
-                bloom_size: config.bloom_size,
-            })
-        }
+        let samplers = Samplers::new(device);
+        let font = config.font.atlas();
+        let (grid_columns, grid_rows) = grid_dimensions(config);
+        let compute = ComputePasses::new(device, grid_columns, grid_rows);
+        let render = RenderPass::new(device, queue, font)?;
+        let primary = RenderTarget::new(device, screen_width, screen_height, TargetFormat::Rgba8);
+        let bloom = BloomPasses::new(
+            device,
+            queue,
+            &samplers,
+            &primary.view,
+            screen_width,
+            screen_height,
+            config.bloom_size,
+        );
+        let effect = EffectPasses::new(device, queue, target_format, config);
+        Ok(Self {
+            samplers,
+            compute,
+            render,
+            bloom,
+            effect,
+            primary,
+            grid_columns,
+            grid_rows,
+            current_font: config.font,
+            screen_width,
+            screen_height,
+            bloom_size: config.bloom_size,
+        })
     }
 
-    pub unsafe fn run(
+    /// Records every offscreen pass for this frame into `encoder` and
+    /// prepares the final composite for [`Passes::paint`].
+    pub fn prepare(
         &mut self,
-        gl: &glow::Context,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
         config: &MatrixConfig,
         time: f32,
         screen_size_px: [u32; 2],
     ) {
-        unsafe {
-            let (grid_columns, grid_rows) = grid_dimensions(config);
-            if grid_columns != self.grid_columns || grid_rows != self.grid_rows {
-                if let Err(err) = self.compute.resize(gl, grid_columns, grid_rows) {
-                    log::error!("egui-screensaver-matrix: failed to resize compute buffers: {err}");
-                } else {
-                    self.grid_columns = grid_columns;
-                    self.grid_rows = grid_rows;
-                }
+        let (grid_columns, grid_rows) = grid_dimensions(config);
+        if grid_columns != self.grid_columns || grid_rows != self.grid_rows {
+            self.compute.resize(device, grid_columns, grid_rows);
+            self.grid_columns = grid_columns;
+            self.grid_rows = grid_rows;
+        }
+
+        if config.font != self.current_font {
+            let font = config.font.atlas();
+            if let Err(err) = self.render.set_font(device, queue, font) {
+                log::error!("egui-screensaver-matrix: failed to switch font: {err}");
+            } else {
+                // Cells' stored `symbol` indices were drawn from the
+                // *old* font's glyphSequenceLength range; reinterpreted
+                // against the new (possibly larger) atlas they'd all
+                // cluster into its low-index corner until each cell
+                // happens to cycle again on its own. Force everyone to
+                // re-roll now instead. See `reset_tick`'s doc comment.
+                self.compute.reset_tick();
+                self.current_font = config.font;
             }
+        }
 
-            if config.font != self.current_font {
-                let font = config.font.atlas();
-                if let Err(err) = self.render.set_font(gl, font) {
-                    log::error!("egui-screensaver-matrix: failed to switch font: {err}");
-                } else {
-                    self.compute
-                        .set_glyph_sequence_length(gl, font.glyph_sequence_length);
-                    // Cells' stored `symbol` indices were drawn from the
-                    // *old* font's glyphSequenceLength range; reinterpreted
-                    // against the new (possibly larger) atlas they'd all
-                    // cluster into its low-index corner until each cell
-                    // happens to cycle again on its own. Force everyone to
-                    // re-roll now instead. See `reset_tick`'s doc comment.
-                    self.compute.reset_tick();
-                    self.current_font = config.font;
-                }
-            }
+        let [screen_width, screen_height] = screen_size_px.map(|v| v.max(1));
+        if screen_width != self.screen_width
+            || screen_height != self.screen_height
+            || config.bloom_size != self.bloom_size
+        {
+            self.primary.resize(device, screen_width, screen_height);
+            self.bloom.resize(
+                device,
+                queue,
+                &self.samplers,
+                &self.primary.view,
+                screen_width,
+                screen_height,
+                config.bloom_size,
+            );
+            self.screen_width = screen_width;
+            self.screen_height = screen_height;
+            self.bloom_size = config.bloom_size;
+        }
 
-            let screen_width = screen_size_px[0] as i32;
-            let screen_height = screen_size_px[1] as i32;
-            if screen_width != self.screen_width
-                || screen_height != self.screen_height
-                || config.bloom_size != self.bloom_size
-            {
-                if let Err(err) = self.primary.resize(gl, screen_width, screen_height) {
-                    log::error!("egui-screensaver-matrix: failed to resize primary target: {err}");
-                }
-                if let Err(err) =
-                    self.bloom
-                        .resize(gl, screen_width, screen_height, config.bloom_size)
-                {
-                    log::error!("egui-screensaver-matrix: failed to resize bloom pyramid: {err}");
-                }
-                self.screen_width = screen_width;
-                self.screen_height = screen_height;
-                self.bloom_size = config.bloom_size;
-            }
+        self.compute.run(
+            device,
+            queue,
+            encoder,
+            &self.samplers,
+            config,
+            time,
+            self.render.glyph_sequence_length(),
+        );
 
-            self.compute.run(gl, config, time);
-
-            self.primary.bind(gl);
-            gl.disable(glow::SCISSOR_TEST);
-            gl.clear_color(0.0, 0.0, 0.0, 1.0);
-            gl.clear(glow::COLOR_BUFFER_BIT);
-            self.render.draw(
-                gl,
-                config,
-                time,
-                self.grid_columns,
-                self.grid_rows,
+        self.render.draw(
+            device,
+            queue,
+            encoder,
+            &self.samplers,
+            config,
+            time,
+            self.grid_columns,
+            self.grid_rows,
+            [
                 self.compute.raindrop_state(),
                 self.compute.symbol_state(),
                 self.compute.effect_state(),
-                screen_width,
-                screen_height,
-            );
+            ],
+            &self.primary.view,
+            screen_width,
+            screen_height,
+        );
 
-            let bloom_texture = self.bloom.run(gl, config, self.primary.texture);
+        self.bloom.run(queue, encoder, config);
 
-            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-            gl.viewport(0, 0, screen_width, screen_height);
-            self.effect
-                .run(gl, config, time, self.primary.texture, bloom_texture);
-        }
+        self.effect.prepare(
+            device,
+            queue,
+            &self.samplers,
+            config,
+            time,
+            &self.primary.view,
+            self.bloom.output(),
+        );
     }
 
-    pub unsafe fn destroy(&self, gl: &glow::Context) {
-        unsafe {
-            self.compute.destroy(gl);
-            self.render.destroy(gl);
-            self.bloom.destroy(gl);
-            self.effect.destroy(gl);
-            self.primary.destroy(gl);
-        }
+    /// Draws the final composite into egui's render pass.
+    pub fn paint(&self, render_pass: &mut wgpu::RenderPass<'static>) {
+        self.effect.paint(render_pass);
     }
 }

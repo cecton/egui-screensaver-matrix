@@ -1,102 +1,51 @@
-//! The bloom pass: a classic 5-level FBO pyramid (highpass -> horizontal
+//! The bloom pass: a classic 5-level pyramid (highpass -> horizontal
 //! blur -> vertical blur per level, each level half the resolution of the
 //! previous) flattened into one bloom texture, ported from
 //! `js/regl/bloomPass.js` / `shaders/glsl/bloomPass.*.frag.glsl` at
 //! https://github.com/Rezmason/matrix (MIT licensed).
 
-use std::sync::Arc;
-
-use glow::HasContext as _;
+use egui_wgpu::wgpu;
 
 use crate::config::MatrixConfig;
-use crate::gl_util::{self, FullscreenTriangle, RenderTarget, TargetFilter, TargetFormat};
+use crate::gpu::{
+    self, PassPipeline, RenderTarget, Samplers, TargetFormat, UniformBuffer, Uniforms,
+};
 
-const FULLSCREEN_VERT_SRC: &str = include_str!("../shaders/fullscreen.vert.glsl");
-const HIGHPASS_FRAG_SRC: &str = include_str!("../shaders/bloom_highpass.frag.glsl");
-const BLUR_FRAG_SRC: &str = include_str!("../shaders/bloom_blur.frag.glsl");
-const COMBINE_FRAG_SRC: &str = include_str!("../shaders/bloom_combine.frag.glsl");
+const HIGHPASS_SRC: &str = include_str!("../shaders/bloom_highpass.wgsl");
+const BLUR_SRC: &str = include_str!("../shaders/bloom_blur.wgsl");
+const COMBINE_SRC: &str = include_str!("../shaders/bloom_combine.wgsl");
 
 const PYRAMID_HEIGHT: usize = 5;
 
-struct HighpassUniforms {
-    tex: Option<glow::UniformLocation>,
-    high_pass_threshold: Option<glow::UniformLocation>,
-}
-
-struct BlurUniforms {
-    tex: Option<glow::UniformLocation>,
-    direction: Option<glow::UniformLocation>,
-    width: Option<glow::UniformLocation>,
-    height: Option<glow::UniformLocation>,
-}
-
-struct CombineUniforms {
-    pyramid: [Option<glow::UniformLocation>; PYRAMID_HEIGHT],
-    bloom_strength: Option<glow::UniformLocation>,
-}
+const FRAGMENT: wgpu::ShaderStages = wgpu::ShaderStages::FRAGMENT;
 
 /// One pyramid level's 3 render targets: highpass -> horizontal blur ->
-/// vertical blur, each at the same (progressively smaller) resolution.
+/// vertical blur, each at the same (progressively smaller) resolution, plus
+/// the blur uniforms (which only depend on the level's size) and the bind
+/// groups wiring the three passes together.
 struct PyramidLevel {
     highpass: RenderTarget,
     h_blur: RenderTarget,
     v_blur: RenderTarget,
+    h_uniforms: UniformBuffer,
+    v_uniforms: UniformBuffer,
+    highpass_group: Option<wgpu::BindGroup>,
+    h_group: Option<wgpu::BindGroup>,
+    v_group: Option<wgpu::BindGroup>,
 }
 
 impl PyramidLevel {
-    unsafe fn new(gl: &glow::Context, width: i32, height: i32) -> Result<Self, String> {
-        unsafe {
-            let highpass =
-                RenderTarget::new(gl, width, height, TargetFormat::Rgba8, TargetFilter::Linear)?;
-            let h_blur = match RenderTarget::new(
-                gl,
-                width,
-                height,
-                TargetFormat::Rgba8,
-                TargetFilter::Linear,
-            ) {
-                Ok(t) => t,
-                Err(err) => {
-                    highpass.destroy(gl);
-                    return Err(err);
-                }
-            };
-            let v_blur = match RenderTarget::new(
-                gl,
-                width,
-                height,
-                TargetFormat::Rgba8,
-                TargetFilter::Linear,
-            ) {
-                Ok(t) => t,
-                Err(err) => {
-                    highpass.destroy(gl);
-                    h_blur.destroy(gl);
-                    return Err(err);
-                }
-            };
-            Ok(Self {
-                highpass,
-                h_blur,
-                v_blur,
-            })
-        }
-    }
-
-    unsafe fn resize(&mut self, gl: &glow::Context, width: i32, height: i32) -> Result<(), String> {
-        unsafe {
-            self.highpass.resize(gl, width, height)?;
-            self.h_blur.resize(gl, width, height)?;
-            self.v_blur.resize(gl, width, height)?;
-            Ok(())
-        }
-    }
-
-    unsafe fn destroy(&self, gl: &glow::Context) {
-        unsafe {
-            self.highpass.destroy(gl);
-            self.h_blur.destroy(gl);
-            self.v_blur.destroy(gl);
+    fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
+        let target = || RenderTarget::new(device, width, height, TargetFormat::Rgba8);
+        Self {
+            highpass: target(),
+            h_blur: target(),
+            v_blur: target(),
+            h_uniforms: UniformBuffer::new(device, "matrix blur h", 16),
+            v_uniforms: UniformBuffer::new(device, "matrix blur v", 16),
+            highpass_group: None,
+            h_group: None,
+            v_group: None,
         }
     }
 }
@@ -104,225 +53,249 @@ impl PyramidLevel {
 /// Level `i`'s resolution: `floor(screen_size * bloom_size / 2^i)`,
 /// clamped to at least 1 pixel so a very small `bloom_size` can't produce
 /// an invalid 0x0 render target.
-fn level_size(screen_size: i32, bloom_size: f32, level: usize) -> i32 {
-    ((screen_size as f32 * bloom_size) as i32 >> level).max(1)
+fn level_size(screen_size: u32, bloom_size: f32, level: usize) -> u32 {
+    (((screen_size as f32 * bloom_size) as u32) >> level).max(1)
 }
 
 pub struct BloomPasses {
-    highpass_program: glow::Program,
-    highpass_triangle: FullscreenTriangle,
-    highpass_uniforms: HighpassUniforms,
-
-    blur_program: glow::Program,
-    blur_triangle: FullscreenTriangle,
-    blur_uniforms: BlurUniforms,
-
-    combine_program: glow::Program,
-    combine_triangle: FullscreenTriangle,
-    combine_uniforms: CombineUniforms,
+    highpass_pass: PassPipeline,
+    highpass_uniforms: UniformBuffer,
+    blur_pass: PassPipeline,
+    combine_pass: PassPipeline,
+    combine_uniforms: UniformBuffer,
     combine_output: RenderTarget,
+    combine_group: Option<wgpu::BindGroup>,
 
     levels: [PyramidLevel; PYRAMID_HEIGHT],
-    screen_width: i32,
-    screen_height: i32,
+    screen_width: u32,
+    screen_height: u32,
     bloom_size: f32,
 }
 
 impl BloomPasses {
-    pub unsafe fn new(
-        gl: &Arc<glow::Context>,
-        header: &str,
-        screen_width: i32,
-        screen_height: i32,
+    pub fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        samplers: &Samplers,
+        primary: &wgpu::TextureView,
+        screen_width: u32,
+        screen_height: u32,
         bloom_size: f32,
-    ) -> Result<Self, String> {
-        unsafe {
-            let highpass_program =
-                gl_util::compile_program(gl, header, FULLSCREEN_VERT_SRC, HIGHPASS_FRAG_SRC)?;
-            let highpass_triangle = FullscreenTriangle::new(gl, highpass_program)?;
-            let highpass_uniforms = HighpassUniforms {
-                tex: gl.get_uniform_location(highpass_program, "tex"),
-                high_pass_threshold: gl.get_uniform_location(highpass_program, "highPassThreshold"),
-            };
-
-            let blur_program =
-                gl_util::compile_program(gl, header, FULLSCREEN_VERT_SRC, BLUR_FRAG_SRC)?;
-            let blur_triangle = FullscreenTriangle::new(gl, blur_program)?;
-            let blur_uniforms = BlurUniforms {
-                tex: gl.get_uniform_location(blur_program, "tex"),
-                direction: gl.get_uniform_location(blur_program, "direction"),
-                width: gl.get_uniform_location(blur_program, "width"),
-                height: gl.get_uniform_location(blur_program, "height"),
-            };
-
-            let combine_program =
-                gl_util::compile_program(gl, header, FULLSCREEN_VERT_SRC, COMBINE_FRAG_SRC)?;
-            let combine_triangle = FullscreenTriangle::new(gl, combine_program)?;
-            let combine_uniforms = CombineUniforms {
-                pyramid: [
-                    gl.get_uniform_location(combine_program, "pyr_0"),
-                    gl.get_uniform_location(combine_program, "pyr_1"),
-                    gl.get_uniform_location(combine_program, "pyr_2"),
-                    gl.get_uniform_location(combine_program, "pyr_3"),
-                    gl.get_uniform_location(combine_program, "pyr_4"),
+    ) -> Self {
+        let format = TargetFormat::Rgba8.wgpu();
+        let single = |label: &str, src: &str, entry: &str| {
+            let module = gpu::shader_module(device, label, src);
+            PassPipeline::new(
+                device,
+                label,
+                &module,
+                "vs_offscreen",
+                entry,
+                &[
+                    gpu::uniform_entry(0, FRAGMENT),
+                    gpu::texture_entry(1, FRAGMENT),
+                    gpu::sampler_entry(2, FRAGMENT),
                 ],
-                bloom_strength: gl.get_uniform_location(combine_program, "bloomStrength"),
-            };
-            let combine_output = RenderTarget::new(
-                gl,
+                &[],
+                format,
+                None,
+            )
+        };
+        let highpass_pass = single("matrix highpass", HIGHPASS_SRC, "fs_highpass");
+        let blur_pass = single("matrix blur", BLUR_SRC, "fs_blur");
+
+        let combine_module = gpu::shader_module(device, "matrix combine", COMBINE_SRC);
+        let mut combine_entries = vec![gpu::uniform_entry(0, FRAGMENT)];
+        combine_entries
+            .extend((1..=PYRAMID_HEIGHT as u32).map(|i| gpu::texture_entry(i, FRAGMENT)));
+        combine_entries.push(gpu::sampler_entry(PYRAMID_HEIGHT as u32 + 1, FRAGMENT));
+        let combine_pass = PassPipeline::new(
+            device,
+            "matrix combine",
+            &combine_module,
+            "vs_offscreen",
+            "fs_combine",
+            &combine_entries,
+            &[],
+            format,
+            None,
+        );
+
+        let levels = std::array::from_fn(|i| {
+            PyramidLevel::new(
+                device,
+                level_size(screen_width, bloom_size, i),
+                level_size(screen_height, bloom_size, i),
+            )
+        });
+
+        let mut this = Self {
+            highpass_pass,
+            highpass_uniforms: UniformBuffer::new(device, "matrix highpass", 16),
+            blur_pass,
+            combine_pass,
+            combine_uniforms: UniformBuffer::new(device, "matrix combine", 16),
+            combine_output: RenderTarget::new(
+                device,
                 screen_width,
                 screen_height,
                 TargetFormat::Rgba8,
-                TargetFilter::Linear,
-            )?;
-
-            let mut level_targets = Vec::with_capacity(PYRAMID_HEIGHT);
-            for i in 0..PYRAMID_HEIGHT {
-                let w = level_size(screen_width, bloom_size, i);
-                let h = level_size(screen_height, bloom_size, i);
-                level_targets.push(PyramidLevel::new(gl, w, h)?);
-            }
-            let levels: [PyramidLevel; PYRAMID_HEIGHT] = level_targets
-                .try_into()
-                .unwrap_or_else(|_| unreachable!("exactly PYRAMID_HEIGHT levels pushed"));
-
-            Ok(Self {
-                highpass_program,
-                highpass_triangle,
-                highpass_uniforms,
-                blur_program,
-                blur_triangle,
-                blur_uniforms,
-                combine_program,
-                combine_triangle,
-                combine_uniforms,
-                combine_output,
-                levels,
-                screen_width,
-                screen_height,
-                bloom_size,
-            })
-        }
+            ),
+            combine_group: None,
+            levels,
+            screen_width,
+            screen_height,
+            bloom_size,
+        };
+        this.rebuild_groups(device, queue, samplers, primary);
+        this
     }
 
-    pub unsafe fn resize(
+    /// Recreates the pyramid when the screen size or `bloom_size` changed.
+    /// `primary` must be the (already resized) texture `run` reads from.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resize(
         &mut self,
-        gl: &glow::Context,
-        screen_width: i32,
-        screen_height: i32,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        samplers: &Samplers,
+        primary: &wgpu::TextureView,
+        screen_width: u32,
+        screen_height: u32,
         bloom_size: f32,
-    ) -> Result<(), String> {
-        unsafe {
-            if screen_width == self.screen_width
-                && screen_height == self.screen_height
-                && bloom_size == self.bloom_size
-            {
-                return Ok(());
-            }
-            self.combine_output
-                .resize(gl, screen_width, screen_height)?;
-            for (i, level) in self.levels.iter_mut().enumerate() {
-                let w = level_size(screen_width, bloom_size, i);
-                let h = level_size(screen_height, bloom_size, i);
-                level.resize(gl, w, h)?;
-            }
-            self.screen_width = screen_width;
-            self.screen_height = screen_height;
-            self.bloom_size = bloom_size;
-            Ok(())
+    ) {
+        if screen_width == self.screen_width
+            && screen_height == self.screen_height
+            && bloom_size == self.bloom_size
+        {
+            return;
         }
+        self.combine_output
+            .resize(device, screen_width, screen_height);
+        for (i, level) in self.levels.iter_mut().enumerate() {
+            *level = PyramidLevel::new(
+                device,
+                level_size(screen_width, bloom_size, i),
+                level_size(screen_height, bloom_size, i),
+            );
+        }
+        self.screen_width = screen_width;
+        self.screen_height = screen_height;
+        self.bloom_size = bloom_size;
+        self.rebuild_groups(device, queue, samplers, primary);
     }
 
-    /// Runs the full highpass -> blur -> blur -> combine pyramid, reading
-    /// `primary_texture` (this frame's rain render) as input, and returns
-    /// the resulting bloom texture. Leaves `GL_SCISSOR_TEST` disabled (see
-    /// the note in `passes/compute.rs`).
-    pub unsafe fn run(
+    /// (Re)writes the size-dependent blur uniforms and builds every bind
+    /// group; all of them only change when a texture is recreated.
+    fn rebuild_groups(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        samplers: &Samplers,
+        primary: &wgpu::TextureView,
+    ) {
+        let mut level_groups = Vec::with_capacity(PYRAMID_HEIGHT);
+        for i in 0..PYRAMID_HEIGHT {
+            let input = if i == 0 {
+                primary
+            } else {
+                &self.levels[i - 1].highpass.view
+            };
+            let level = &self.levels[i];
+            let (width, height) = (level.highpass.width as f32, level.highpass.height as f32);
+
+            let mut u = Uniforms::new();
+            u.f32(width).f32(height).vec2([1.0, 0.0]);
+            level.h_uniforms.write(queue, u);
+            let mut u = Uniforms::new();
+            u.f32(width).f32(height).vec2([0.0, 1.0]);
+            level.v_uniforms.write(queue, u);
+
+            let highpass_group = self.highpass_pass.bind_group(
+                device,
+                &[
+                    gpu::entry(0, self.highpass_uniforms.binding()),
+                    gpu::entry(1, wgpu::BindingResource::TextureView(input)),
+                    gpu::entry(2, wgpu::BindingResource::Sampler(&samplers.linear)),
+                ],
+            );
+            let h_group = self.blur_pass.bind_group(
+                device,
+                &[
+                    gpu::entry(0, level.h_uniforms.binding()),
+                    gpu::entry(1, wgpu::BindingResource::TextureView(&level.highpass.view)),
+                    gpu::entry(2, wgpu::BindingResource::Sampler(&samplers.linear)),
+                ],
+            );
+            let v_group = self.blur_pass.bind_group(
+                device,
+                &[
+                    gpu::entry(0, level.v_uniforms.binding()),
+                    gpu::entry(1, wgpu::BindingResource::TextureView(&level.h_blur.view)),
+                    gpu::entry(2, wgpu::BindingResource::Sampler(&samplers.linear)),
+                ],
+            );
+            level_groups.push((highpass_group, h_group, v_group));
+        }
+        for (level, (highpass, h, v)) in self.levels.iter_mut().zip(level_groups) {
+            level.highpass_group = Some(highpass);
+            level.h_group = Some(h);
+            level.v_group = Some(v);
+        }
+
+        let mut entries = vec![gpu::entry(0, self.combine_uniforms.binding())];
+        for (i, level) in self.levels.iter().enumerate() {
+            entries.push(gpu::entry(
+                i as u32 + 1,
+                wgpu::BindingResource::TextureView(&level.v_blur.view),
+            ));
+        }
+        entries.push(gpu::entry(
+            PYRAMID_HEIGHT as u32 + 1,
+            wgpu::BindingResource::Sampler(&samplers.linear),
+        ));
+        self.combine_group = Some(self.combine_pass.bind_group(device, &entries));
+    }
+
+    /// Records the full highpass -> blur -> blur -> combine pyramid (reading
+    /// the `primary` texture handed to `new`/`resize`) and returns the
+    /// resulting bloom texture.
+    pub fn run(
         &self,
-        gl: &glow::Context,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
         config: &MatrixConfig,
-        primary_texture: glow::Texture,
-    ) -> glow::Texture {
-        unsafe {
-            gl.disable(glow::SCISSOR_TEST);
-            gl.disable(glow::BLEND);
+    ) -> &wgpu::TextureView {
+        let mut u = Uniforms::new();
+        u.f32(config.high_pass_threshold);
+        self.highpass_uniforms.write(queue, u);
+        let mut u = Uniforms::new();
+        u.f32(config.bloom_strength);
+        self.combine_uniforms.write(queue, u);
 
-            gl.use_program(Some(self.highpass_program));
-            gl.uniform_1_i32(self.highpass_uniforms.tex.as_ref(), 0);
-            gl.uniform_1_f32(
-                self.highpass_uniforms.high_pass_threshold.as_ref(),
-                config.high_pass_threshold,
-            );
-
-            gl.use_program(Some(self.blur_program));
-            gl.uniform_1_i32(self.blur_uniforms.tex.as_ref(), 0);
-
-            for (i, level) in self.levels.iter().enumerate() {
-                let input = if i == 0 {
-                    primary_texture
-                } else {
-                    self.levels[i - 1].highpass.texture
-                };
-
-                gl.use_program(Some(self.highpass_program));
-                level.highpass.bind(gl);
-                gl.active_texture(glow::TEXTURE0);
-                gl.bind_texture(glow::TEXTURE_2D, Some(input));
-                self.highpass_triangle.draw(gl);
-
-                gl.use_program(Some(self.blur_program));
-                gl.uniform_1_f32(
-                    self.blur_uniforms.width.as_ref(),
-                    level.highpass.width as f32,
-                );
-                gl.uniform_1_f32(
-                    self.blur_uniforms.height.as_ref(),
-                    level.highpass.height as f32,
-                );
-
-                level.h_blur.bind(gl);
-                gl.active_texture(glow::TEXTURE0);
-                gl.bind_texture(glow::TEXTURE_2D, Some(level.highpass.texture));
-                gl.uniform_2_f32(self.blur_uniforms.direction.as_ref(), 1.0, 0.0);
-                self.blur_triangle.draw(gl);
-
-                level.v_blur.bind(gl);
-                gl.active_texture(glow::TEXTURE0);
-                gl.bind_texture(glow::TEXTURE_2D, Some(level.h_blur.texture));
-                gl.uniform_2_f32(self.blur_uniforms.direction.as_ref(), 0.0, 1.0);
-                self.blur_triangle.draw(gl);
-            }
-
-            self.combine_output.bind(gl);
-            gl.use_program(Some(self.combine_program));
-            for (i, loc) in self.combine_uniforms.pyramid.iter().enumerate() {
-                gl.active_texture(glow::TEXTURE0 + i as u32);
-                gl.bind_texture(glow::TEXTURE_2D, Some(self.levels[i].v_blur.texture));
-                gl.uniform_1_i32(loc.as_ref(), i as i32);
-            }
-            gl.uniform_1_f32(
-                self.combine_uniforms.bloom_strength.as_ref(),
-                config.bloom_strength,
-            );
-            self.combine_triangle.draw(gl);
-
-            gl.bind_texture(glow::TEXTURE_2D, None);
-            self.combine_output.texture
+        for level in &self.levels {
+            let (Some(highpass), Some(h), Some(v)) =
+                (&level.highpass_group, &level.h_group, &level.v_group)
+            else {
+                continue;
+            };
+            gpu::draw_fullscreen(encoder, &level.highpass.view, &self.highpass_pass, highpass);
+            gpu::draw_fullscreen(encoder, &level.h_blur.view, &self.blur_pass, h);
+            gpu::draw_fullscreen(encoder, &level.v_blur.view, &self.blur_pass, v);
         }
+
+        if let Some(group) = &self.combine_group {
+            gpu::draw_fullscreen(
+                encoder,
+                &self.combine_output.view,
+                &self.combine_pass,
+                group,
+            );
+        }
+        &self.combine_output.view
     }
 
-    pub unsafe fn destroy(&self, gl: &glow::Context) {
-        unsafe {
-            for level in &self.levels {
-                level.destroy(gl);
-            }
-            self.combine_output.destroy(gl);
-            self.highpass_triangle.destroy(gl);
-            self.blur_triangle.destroy(gl);
-            self.combine_triangle.destroy(gl);
-            gl.delete_program(self.highpass_program);
-            gl.delete_program(self.blur_program);
-            gl.delete_program(self.combine_program);
-        }
+    pub fn output(&self) -> &wgpu::TextureView {
+        &self.combine_output.view
     }
 }

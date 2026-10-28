@@ -1,28 +1,27 @@
-//! The 4 ping-pong "compute" passes that drive the rain simulation: intro
-//! reveal, raindrop fall/decay, glyph cycling, and ripple/thunder effects.
-//! Each is a tiny offscreen render target (grid resolution, not screen
-//! resolution) redrawn every frame from its own previous frame's output.
+//! The 4 "compute" passes that drive the rain simulation: intro reveal,
+//! raindrop fall/decay, glyph cycling, and ripple/thunder effects. Each is a
+//! tiny offscreen render target (grid resolution, not screen resolution);
+//! raindrop and symbol are redrawn every tick from their own previous
+//! output (ping-pong), intro and effect are pure functions of time.
 
-use std::sync::Arc;
+use egui_wgpu::wgpu;
 
-use glow::HasContext as _;
+use crate::config::{MatrixConfig, RippleType};
+use crate::gpu::{
+    self, PassPipeline, PingPong, RenderTarget, Samplers, TargetFormat, UniformBuffer, Uniforms,
+};
 
-use crate::config::MatrixConfig;
-use crate::fonts::FontAtlas;
-use crate::gl_util::{self, FullscreenTriangle, PingPong, TargetFormat};
-
-const FULLSCREEN_VERT_SRC: &str = include_str!("../shaders/fullscreen.vert.glsl");
-const INTRO_FRAG_SRC: &str = include_str!("../shaders/intro.frag.glsl");
-const RAINDROP_FRAG_SRC: &str = include_str!("../shaders/raindrop.frag.glsl");
-const SYMBOL_FRAG_SRC: &str = include_str!("../shaders/symbol.frag.glsl");
-const EFFECT_FRAG_SRC: &str = include_str!("../shaders/effect.frag.glsl");
+const INTRO_SRC: &str = include_str!("../shaders/intro.wgsl");
+const RAINDROP_SRC: &str = include_str!("../shaders/raindrop.wgsl");
+const SYMBOL_SRC: &str = include_str!("../shaders/symbol.wgsl");
+const EFFECT_SRC: &str = include_str!("../shaders/effect.wgsl");
 
 /// Real-time duration one logical `tick` represents, in seconds. Must
 /// match `MatrixBackground`'s own repaint-request cadence
 /// (`REPAINT_MS` in `lib.rs`, currently 33ms i.e. ~30fps) rather than the
 /// original Rezmason/matrix source's 60fps assumption
 /// (`js/config.js`'s `fps: 60`): under normal conditions, each rendered
-/// frame must represent at most one logical tick, or `symbol.frag.glsl`'s
+/// frame must represent at most one logical tick, or `symbol.wgsl`'s
 /// per-cell phase-based desync (each cell's own `previousAge` spreads out
 /// *when* it crosses the glyph-cycling threshold) collapses into a
 /// synchronized mass reassignment whenever more than one tick's worth of
@@ -33,87 +32,32 @@ const EFFECT_FRAG_SRC: &str = include_str!("../shaders/effect.frag.glsl");
 /// running roughly half as fast, absolute-speed-wise, as the original.
 const NOMINAL_TICK_SECS: f32 = 1.0 / 30.0;
 
-struct IntroUniforms {
-    previous_intro_state: Option<glow::UniformLocation>,
-    num_columns: Option<glow::UniformLocation>,
-    num_rows: Option<glow::UniformLocation>,
-    time: Option<glow::UniformLocation>,
-    tick: Option<glow::UniformLocation>,
-    animation_speed: Option<glow::UniformLocation>,
-    fall_speed: Option<glow::UniformLocation>,
-    skip_intro: Option<glow::UniformLocation>,
-}
+const FRAGMENT: wgpu::ShaderStages = wgpu::ShaderStages::FRAGMENT;
 
-struct RaindropUniforms {
-    previous_raindrop_state: Option<glow::UniformLocation>,
-    intro_state: Option<glow::UniformLocation>,
-    num_columns: Option<glow::UniformLocation>,
-    num_rows: Option<glow::UniformLocation>,
-    time: Option<glow::UniformLocation>,
-    tick: Option<glow::UniformLocation>,
-    animation_speed: Option<glow::UniformLocation>,
-    fall_speed: Option<glow::UniformLocation>,
-    loops: Option<glow::UniformLocation>,
-    skip_intro: Option<glow::UniformLocation>,
-    brightness_decay: Option<glow::UniformLocation>,
-    raindrop_length: Option<glow::UniformLocation>,
-}
+/// Size in bytes of each pass's (16-byte padded) uniform block.
+const INTRO_UNIFORM_SIZE: u64 = 32;
+const RAINDROP_UNIFORM_SIZE: u64 = 48;
+const SYMBOL_UNIFORM_SIZE: u64 = 48;
+const EFFECT_UNIFORM_SIZE: u64 = 48;
 
-struct SymbolUniforms {
-    previous_symbol_state: Option<glow::UniformLocation>,
-    raindrop_state: Option<glow::UniformLocation>,
-    num_columns: Option<glow::UniformLocation>,
-    num_rows: Option<glow::UniformLocation>,
-    time: Option<glow::UniformLocation>,
-    tick: Option<glow::UniformLocation>,
-    cycle_frame_skip: Option<glow::UniformLocation>,
-    animation_speed: Option<glow::UniformLocation>,
-    cycle_speed: Option<glow::UniformLocation>,
-    loops: Option<glow::UniformLocation>,
-    glyph_sequence_length: Option<glow::UniformLocation>,
-    /// See `count_gate_events` — how many times the glyph-cycling gate
-    /// would have fired had ticks been advanced one at a time instead of
-    /// batched, since the last call to `run`.
-    gate_event_count: Option<glow::UniformLocation>,
-}
-
-struct EffectUniforms {
-    num_columns: Option<glow::UniformLocation>,
-    num_rows: Option<glow::UniformLocation>,
-    time: Option<glow::UniformLocation>,
-    tick: Option<glow::UniformLocation>,
-    animation_speed: Option<glow::UniformLocation>,
-    has_thunder: Option<glow::UniformLocation>,
-    loops: Option<glow::UniformLocation>,
-    glyph_height_to_width: Option<glow::UniformLocation>,
-    ripple_type: Option<glow::UniformLocation>,
-    ripple_scale: Option<glow::UniformLocation>,
-    ripple_speed: Option<glow::UniformLocation>,
-    ripple_thickness: Option<glow::UniformLocation>,
-}
-
-/// The 4 ping-pong compute passes plus the shared bookkeeping (grid
-/// resolution, frame tick counter) they all need.
+/// The 4 compute passes plus the shared bookkeeping (grid resolution,
+/// frame tick counter) they all need.
 pub struct ComputePasses {
-    intro_program: glow::Program,
-    intro_triangle: FullscreenTriangle,
-    intro_uniforms: IntroUniforms,
-    intro_buf: PingPong,
+    intro_pass: PassPipeline,
+    intro_uniforms: UniformBuffer,
+    intro_target: RenderTarget,
 
-    raindrop_program: glow::Program,
-    raindrop_triangle: FullscreenTriangle,
-    raindrop_uniforms: RaindropUniforms,
+    raindrop_pass: PassPipeline,
+    raindrop_uniforms: UniformBuffer,
     raindrop_buf: PingPong,
 
-    symbol_program: glow::Program,
-    symbol_triangle: FullscreenTriangle,
-    symbol_uniforms: SymbolUniforms,
+    symbol_pass: PassPipeline,
+    symbol_uniforms: UniformBuffer,
     symbol_buf: PingPong,
 
-    effect_program: glow::Program,
-    effect_triangle: FullscreenTriangle,
-    effect_uniforms: EffectUniforms,
-    effect_buf: PingPong,
+    effect_pass: PassPipeline,
+    effect_uniforms: UniformBuffer,
+    effect_target: RenderTarget,
 
     num_columns: u32,
     num_rows: u32,
@@ -126,171 +70,80 @@ pub struct ComputePasses {
 }
 
 impl ComputePasses {
-    pub unsafe fn new(
-        gl: &Arc<glow::Context>,
-        header: &str,
-        num_columns: u32,
-        num_rows: u32,
-        font: &FontAtlas,
-    ) -> Result<Self, String> {
-        unsafe {
-            let intro_program =
-                gl_util::compile_program(gl, header, FULLSCREEN_VERT_SRC, INTRO_FRAG_SRC)?;
-            let intro_triangle = FullscreenTriangle::new(gl, intro_program)?;
-            let intro_uniforms = IntroUniforms {
-                previous_intro_state: gl.get_uniform_location(intro_program, "previousIntroState"),
-                num_columns: gl.get_uniform_location(intro_program, "numColumns"),
-                num_rows: gl.get_uniform_location(intro_program, "numRows"),
-                time: gl.get_uniform_location(intro_program, "time"),
-                tick: gl.get_uniform_location(intro_program, "tick"),
-                animation_speed: gl.get_uniform_location(intro_program, "animationSpeed"),
-                fall_speed: gl.get_uniform_location(intro_program, "fallSpeed"),
-                skip_intro: gl.get_uniform_location(intro_program, "skipIntro"),
-            };
-            let intro_buf = PingPong::new(
-                gl,
-                num_columns as i32,
-                1,
-                TargetFormat::Rgba16F,
-                gl_util::TargetFilter::Nearest,
-            )?;
+    pub fn new(device: &wgpu::Device, num_columns: u32, num_rows: u32) -> Self {
+        let state_format = TargetFormat::Rgba16F.wgpu();
+        let make = |label: &str, src: &str, entries: &[wgpu::BindGroupLayoutEntry]| {
+            let module = gpu::shader_module(device, label, src);
+            PassPipeline::new(
+                device,
+                label,
+                &module,
+                "vs_offscreen",
+                "fs_main",
+                entries,
+                &[],
+                state_format,
+                None,
+            )
+        };
 
-            let raindrop_program =
-                gl_util::compile_program(gl, header, FULLSCREEN_VERT_SRC, RAINDROP_FRAG_SRC)?;
-            let raindrop_triangle = FullscreenTriangle::new(gl, raindrop_program)?;
-            let raindrop_uniforms = RaindropUniforms {
-                previous_raindrop_state: gl
-                    .get_uniform_location(raindrop_program, "previousRaindropState"),
-                intro_state: gl.get_uniform_location(raindrop_program, "introState"),
-                num_columns: gl.get_uniform_location(raindrop_program, "numColumns"),
-                num_rows: gl.get_uniform_location(raindrop_program, "numRows"),
-                time: gl.get_uniform_location(raindrop_program, "time"),
-                tick: gl.get_uniform_location(raindrop_program, "tick"),
-                animation_speed: gl.get_uniform_location(raindrop_program, "animationSpeed"),
-                fall_speed: gl.get_uniform_location(raindrop_program, "fallSpeed"),
-                loops: gl.get_uniform_location(raindrop_program, "loops"),
-                skip_intro: gl.get_uniform_location(raindrop_program, "skipIntro"),
-                brightness_decay: gl.get_uniform_location(raindrop_program, "brightnessDecay"),
-                raindrop_length: gl.get_uniform_location(raindrop_program, "raindropLength"),
-            };
-            let raindrop_buf = PingPong::new(
-                gl,
-                num_columns as i32,
-                num_rows as i32,
-                TargetFormat::Rgba16F,
-                gl_util::TargetFilter::Nearest,
-            )?;
+        let intro_pass = make(
+            "matrix intro",
+            INTRO_SRC,
+            &[gpu::uniform_entry(0, FRAGMENT)],
+        );
+        let raindrop_pass = make(
+            "matrix raindrop",
+            RAINDROP_SRC,
+            &[
+                gpu::uniform_entry(0, FRAGMENT),
+                gpu::texture_entry(1, FRAGMENT),
+                gpu::texture_entry(2, FRAGMENT),
+                gpu::sampler_entry(3, FRAGMENT),
+            ],
+        );
+        let symbol_pass = make(
+            "matrix symbol",
+            SYMBOL_SRC,
+            &[
+                gpu::uniform_entry(0, FRAGMENT),
+                gpu::texture_entry(1, FRAGMENT),
+                gpu::texture_entry(2, FRAGMENT),
+                gpu::sampler_entry(3, FRAGMENT),
+            ],
+        );
+        let effect_pass = make(
+            "matrix effect",
+            EFFECT_SRC,
+            &[gpu::uniform_entry(0, FRAGMENT)],
+        );
 
-            let symbol_program =
-                gl_util::compile_program(gl, header, FULLSCREEN_VERT_SRC, SYMBOL_FRAG_SRC)?;
-            let symbol_triangle = FullscreenTriangle::new(gl, symbol_program)?;
-            let symbol_uniforms = SymbolUniforms {
-                previous_symbol_state: gl
-                    .get_uniform_location(symbol_program, "previousSymbolState"),
-                raindrop_state: gl.get_uniform_location(symbol_program, "raindropState"),
-                num_columns: gl.get_uniform_location(symbol_program, "numColumns"),
-                num_rows: gl.get_uniform_location(symbol_program, "numRows"),
-                time: gl.get_uniform_location(symbol_program, "time"),
-                tick: gl.get_uniform_location(symbol_program, "tick"),
-                cycle_frame_skip: gl.get_uniform_location(symbol_program, "cycleFrameSkip"),
-                animation_speed: gl.get_uniform_location(symbol_program, "animationSpeed"),
-                cycle_speed: gl.get_uniform_location(symbol_program, "cycleSpeed"),
-                loops: gl.get_uniform_location(symbol_program, "loops"),
-                glyph_sequence_length: gl
-                    .get_uniform_location(symbol_program, "glyphSequenceLength"),
-                gate_event_count: gl.get_uniform_location(symbol_program, "gateEventCount"),
-            };
-            // `glyphSequenceLength` depends only on the font, not on any
-            // per-frame state, so it's set once here rather than every
-            // frame in `run` — uniform values persist on a program
-            // regardless of which program is currently bound.
-            gl.use_program(Some(symbol_program));
-            gl.uniform_1_f32(
-                symbol_uniforms.glyph_sequence_length.as_ref(),
-                font.glyph_sequence_length as f32,
-            );
-            gl.use_program(None);
-            let symbol_buf = PingPong::new(
-                gl,
-                num_columns as i32,
-                num_rows as i32,
-                TargetFormat::Rgba16F,
-                gl_util::TargetFilter::Nearest,
-            )?;
-
-            let effect_program =
-                gl_util::compile_program(gl, header, FULLSCREEN_VERT_SRC, EFFECT_FRAG_SRC)?;
-            let effect_triangle = FullscreenTriangle::new(gl, effect_program)?;
-            let effect_uniforms = EffectUniforms {
-                num_columns: gl.get_uniform_location(effect_program, "numColumns"),
-                num_rows: gl.get_uniform_location(effect_program, "numRows"),
-                time: gl.get_uniform_location(effect_program, "time"),
-                tick: gl.get_uniform_location(effect_program, "tick"),
-                animation_speed: gl.get_uniform_location(effect_program, "animationSpeed"),
-                has_thunder: gl.get_uniform_location(effect_program, "hasThunder"),
-                loops: gl.get_uniform_location(effect_program, "loops"),
-                glyph_height_to_width: gl
-                    .get_uniform_location(effect_program, "glyphHeightToWidth"),
-                ripple_type: gl.get_uniform_location(effect_program, "rippleType"),
-                ripple_scale: gl.get_uniform_location(effect_program, "rippleScale"),
-                ripple_speed: gl.get_uniform_location(effect_program, "rippleSpeed"),
-                ripple_thickness: gl.get_uniform_location(effect_program, "rippleThickness"),
-            };
-            let effect_buf = PingPong::new(
-                gl,
-                num_columns as i32,
-                num_rows as i32,
-                TargetFormat::Rgba16F,
-                gl_util::TargetFilter::Nearest,
-            )?;
-
-            Ok(Self {
-                intro_program,
-                intro_triangle,
-                intro_uniforms,
-                intro_buf,
-                raindrop_program,
-                raindrop_triangle,
-                raindrop_uniforms,
-                raindrop_buf,
-                symbol_program,
-                symbol_triangle,
-                symbol_uniforms,
-                symbol_buf,
-                effect_program,
-                effect_triangle,
-                effect_uniforms,
-                effect_buf,
-                num_columns,
-                num_rows,
-                tick: 0,
-                last_tick_time: 0.0,
-            })
-        }
-    }
-
-    /// Updates the symbol pass's `glyphSequenceLength` uniform for a new
-    /// font (this value depends only on the font, so it's normally set
-    /// once at construction — see the comment where it's first set — but
-    /// needs updating if the font changes at runtime, e.g. a preset
-    /// switch).
-    pub unsafe fn set_glyph_sequence_length(&self, gl: &glow::Context, glyph_sequence_length: u32) {
-        unsafe {
-            gl.use_program(Some(self.symbol_program));
-            gl.uniform_1_f32(
-                self.symbol_uniforms.glyph_sequence_length.as_ref(),
-                glyph_sequence_length as f32,
-            );
-            gl.use_program(None);
+        Self {
+            intro_pass,
+            intro_uniforms: UniformBuffer::new(device, "matrix intro", INTRO_UNIFORM_SIZE),
+            intro_target: RenderTarget::new(device, num_columns, 1, TargetFormat::Rgba16F),
+            raindrop_pass,
+            raindrop_uniforms: UniformBuffer::new(device, "matrix raindrop", RAINDROP_UNIFORM_SIZE),
+            raindrop_buf: PingPong::new(device, num_columns, num_rows, TargetFormat::Rgba16F),
+            symbol_pass,
+            symbol_uniforms: UniformBuffer::new(device, "matrix symbol", SYMBOL_UNIFORM_SIZE),
+            symbol_buf: PingPong::new(device, num_columns, num_rows, TargetFormat::Rgba16F),
+            effect_pass,
+            effect_uniforms: UniformBuffer::new(device, "matrix effect", EFFECT_UNIFORM_SIZE),
+            effect_target: RenderTarget::new(device, num_columns, num_rows, TargetFormat::Rgba16F),
+            num_columns,
+            num_rows,
+            tick: 0,
+            last_tick_time: 0.0,
         }
     }
 
     /// Resets the tick counter, forcing every cell through the
-    /// `isFirstFrame`/`resetGlyph` path on the next `run()` — cheaply
+    /// `is_first_frame`/`reset_glyph` path on the next `run()` — cheaply
     /// re-rolling each cell's stored `symbol` index fresh against
-    /// whatever `glyphSequenceLength` is current. Must be called whenever
+    /// whatever `glyph_sequence_length` is current. Must be called whenever
     /// a change makes the previously-stored per-cell `symbol_buf` state
-    /// stale: switching to a font with a different `glyphSequenceLength`
+    /// stale: switching to a font with a different `glyph_sequence_length`
     /// (see `passes/mod.rs`'s font-switch branch) reuses the ping-pong
     /// buffer's old indices, which were only ever drawn from the
     /// *previous* font's (possibly much smaller) range — reinterpreted
@@ -308,261 +161,236 @@ impl ComputePasses {
     /// `passes/mod.rs` — non-volumetric mode always has `num_rows ==
     /// num_columns`, matching the original: the render pass maps this
     /// square grid onto the possibly-non-square viewport via a
-    /// `screenSize` stretch/crop instead of a non-square grid), matching
+    /// `screen_size` stretch/crop instead of a non-square grid), matching
     /// the original's own resize behavior of losing transient state on a
     /// resolution change.
-    pub unsafe fn resize(
-        &mut self,
-        gl: &glow::Context,
-        num_columns: u32,
-        num_rows: u32,
-    ) -> Result<(), String> {
-        unsafe {
-            if num_columns == self.num_columns && num_rows == self.num_rows {
-                return Ok(());
-            }
-            self.intro_buf.resize(gl, num_columns as i32, 1)?;
-            self.raindrop_buf
-                .resize(gl, num_columns as i32, num_rows as i32)?;
-            self.symbol_buf
-                .resize(gl, num_columns as i32, num_rows as i32)?;
-            self.effect_buf
-                .resize(gl, num_columns as i32, num_rows as i32)?;
-            self.num_columns = num_columns;
-            self.num_rows = num_rows;
-            // The freshly (re)created buffers above start blank (every
-            // cell's `previousAge`/`previousSymbol` reads back as 0)
-            // rather than through the proper per-cell random reset path,
-            // which only fires when `isFirstFrame` is true — without this,
-            // every cell would start in lockstep (same age, same symbol)
-            // instead of independently phased. See `reset_tick`'s doc
-            // comment for the same underlying "stale/invalid state must
-            // trigger a reset" reasoning.
-            self.reset_tick();
-            Ok(())
+    pub fn resize(&mut self, device: &wgpu::Device, num_columns: u32, num_rows: u32) {
+        if num_columns == self.num_columns && num_rows == self.num_rows {
+            return;
         }
+        self.intro_target.resize(device, num_columns, 1);
+        self.raindrop_buf.resize(device, num_columns, num_rows);
+        self.symbol_buf.resize(device, num_columns, num_rows);
+        self.effect_target.resize(device, num_columns, num_rows);
+        self.num_columns = num_columns;
+        self.num_rows = num_rows;
+        // The freshly (re)created buffers above start blank (every
+        // cell's `previousAge`/`previousSymbol` reads back as 0)
+        // rather than through the proper per-cell random reset path,
+        // which only fires when `is_first_frame` is true — without this,
+        // every cell would start in lockstep (same age, same symbol)
+        // instead of independently phased. See `reset_tick`'s doc
+        // comment for the same underlying "stale/invalid state must
+        // trigger a reset" reasoning.
+        self.reset_tick();
     }
 
-    /// Runs intro -> raindrop -> symbol -> effect in order, then swaps
-    /// every ping-pong buffer for next frame. `raindrop_state()`,
+    /// Records intro -> raindrop -> symbol -> effect, then swaps the
+    /// ping-pong buffers for next frame. `raindrop_state()`,
     /// `symbol_state()`, and `effect_state()` are valid to sample
-    /// (reflecting this frame's freshly computed state) immediately after
-    /// this returns, until the next call to `run`.
+    /// (reflecting this frame's freshly computed state) once the encoder
+    /// has been submitted, until the next call to `run`.
     ///
     /// This is a no-op (no draws, no ping-pong swaps, no state mutation —
     /// `raindrop_state()` etc. keep returning whatever they returned last
     /// time) if no new logical tick has elapsed since the previous call to
     /// `run`. This matters because `cycle_frame_skip == 1` (the default)
-    /// makes `symbol.frag.glsl`'s `mod(tick, cycleFrameSkip) == 0.` gate a
-    /// no-op — it's always true — so without this early return, calling
-    /// `run` more often than the nominal tick rate (e.g. extra repaints
-    /// `eframe` forces on mouse movement) would advance the glyph-cycling
-    /// `age` accumulator once per *call* rather than once per elapsed
-    /// tick, exactly the bug this whole tick-pacing mechanism exists to
-    /// prevent. Skipping only this pass (not the render/bloom/effect
-    /// passes downstream, which still redraw every call) avoids a missing-
-    /// frame flicker, since unlike the original's persistent browser
-    /// canvas, egui repaints the whole window every call and expects a
-    /// fresh frame back.
-    pub unsafe fn run(&mut self, gl: &glow::Context, config: &MatrixConfig, time: f32) {
-        unsafe {
-            let previous_tick = self.tick;
-            (self.tick, self.last_tick_time) = advance_tick(self.tick, self.last_tick_time, time);
-            if self.tick == previous_tick {
-                return;
-            }
-            let ticks_elapsed = self.tick - previous_tick;
-            let gate_event_count =
-                count_gate_events(previous_tick, self.tick, config.cycle_frame_skip) as f32;
-            // `mix(prev, target, decay)` applied once per elapsed tick, N
-            // times in a row, is equivalent to a single
-            // `mix(prev, target, 1 - (1-decay)^N)` (holding the target
-            // constant across the batch — see `count_gate_events`'s doc
-            // comment for the analogous reasoning behind batching ticks in
-            // the first place). This keeps `brightness_decay`'s organic
-            // fade rate correct even when `ticks_elapsed > 1`, without
-            // needing a shader-side loop.
-            let effective_brightness_decay =
-                1.0 - (1.0 - config.brightness_decay).powi(ticks_elapsed as i32);
-            let tick = self.tick as f32;
-            let num_columns = self.num_columns as f32;
-            let num_rows = self.num_rows as f32;
-
-            // egui_glow leaves GL_SCISSOR_TEST enabled (with whatever rect
-            // it last clipped a UI element to) between paint callbacks, and
-            // GL_BLEND enabled/disabled depending on what it last drew.
-            // Without disabling both here, our "full buffer" fullscreen-
-            // triangle draws would only update the sub-rect still covered
-            // by a stale scissor rect, leaving the rest of the buffer's
-            // previous contents in place — which, fed back through the
-            // ping-pong buffers, explains runaway/incoherent per-cell state.
-            gl.disable(glow::SCISSOR_TEST);
-            gl.disable(glow::BLEND);
-
-            // --- intro ---
-            self.intro_buf.write().bind(gl);
-            gl.use_program(Some(self.intro_program));
-            gl.active_texture(glow::TEXTURE0);
-            gl.bind_texture(glow::TEXTURE_2D, Some(self.intro_buf.read().texture));
-            gl.uniform_1_i32(self.intro_uniforms.previous_intro_state.as_ref(), 0);
-            gl.uniform_1_f32(self.intro_uniforms.num_columns.as_ref(), num_columns);
-            gl.uniform_1_f32(self.intro_uniforms.num_rows.as_ref(), num_rows);
-            gl.uniform_1_f32(self.intro_uniforms.time.as_ref(), time);
-            gl.uniform_1_f32(self.intro_uniforms.tick.as_ref(), tick);
-            gl.uniform_1_f32(
-                self.intro_uniforms.animation_speed.as_ref(),
-                config.animation_speed,
-            );
-            gl.uniform_1_f32(self.intro_uniforms.fall_speed.as_ref(), config.fall_speed);
-            gl.uniform_1_i32(
-                self.intro_uniforms.skip_intro.as_ref(),
-                config.skip_intro as i32,
-            );
-            self.intro_triangle.draw(gl);
-            self.intro_buf.swap();
-
-            // --- raindrop ---
-            self.raindrop_buf.write().bind(gl);
-            gl.use_program(Some(self.raindrop_program));
-            gl.active_texture(glow::TEXTURE0);
-            gl.bind_texture(glow::TEXTURE_2D, Some(self.raindrop_buf.read().texture));
-            gl.active_texture(glow::TEXTURE1);
-            gl.bind_texture(glow::TEXTURE_2D, Some(self.intro_buf.read().texture));
-            gl.uniform_1_i32(self.raindrop_uniforms.previous_raindrop_state.as_ref(), 0);
-            gl.uniform_1_i32(self.raindrop_uniforms.intro_state.as_ref(), 1);
-            gl.uniform_1_f32(self.raindrop_uniforms.num_columns.as_ref(), num_columns);
-            gl.uniform_1_f32(self.raindrop_uniforms.num_rows.as_ref(), num_rows);
-            gl.uniform_1_f32(self.raindrop_uniforms.time.as_ref(), time);
-            gl.uniform_1_f32(self.raindrop_uniforms.tick.as_ref(), tick);
-            gl.uniform_1_f32(
-                self.raindrop_uniforms.animation_speed.as_ref(),
-                config.animation_speed,
-            );
-            gl.uniform_1_f32(
-                self.raindrop_uniforms.fall_speed.as_ref(),
-                config.fall_speed,
-            );
-            gl.uniform_1_i32(self.raindrop_uniforms.loops.as_ref(), 0);
-            gl.uniform_1_i32(
-                self.raindrop_uniforms.skip_intro.as_ref(),
-                config.skip_intro as i32,
-            );
-            gl.uniform_1_f32(
-                self.raindrop_uniforms.brightness_decay.as_ref(),
-                effective_brightness_decay,
-            );
-            gl.uniform_1_f32(
-                self.raindrop_uniforms.raindrop_length.as_ref(),
-                config.raindrop_length,
-            );
-            self.raindrop_triangle.draw(gl);
-            self.raindrop_buf.swap();
-
-            // --- symbol ---
-            self.symbol_buf.write().bind(gl);
-            gl.use_program(Some(self.symbol_program));
-            gl.active_texture(glow::TEXTURE0);
-            gl.bind_texture(glow::TEXTURE_2D, Some(self.symbol_buf.read().texture));
-            gl.active_texture(glow::TEXTURE1);
-            gl.bind_texture(glow::TEXTURE_2D, Some(self.raindrop_buf.read().texture));
-            gl.uniform_1_i32(self.symbol_uniforms.previous_symbol_state.as_ref(), 0);
-            gl.uniform_1_i32(self.symbol_uniforms.raindrop_state.as_ref(), 1);
-            gl.uniform_1_f32(self.symbol_uniforms.num_columns.as_ref(), num_columns);
-            gl.uniform_1_f32(self.symbol_uniforms.num_rows.as_ref(), num_rows);
-            gl.uniform_1_f32(self.symbol_uniforms.time.as_ref(), time);
-            gl.uniform_1_f32(self.symbol_uniforms.tick.as_ref(), tick);
-            gl.uniform_1_f32(
-                self.symbol_uniforms.cycle_frame_skip.as_ref(),
-                config.cycle_frame_skip as f32,
-            );
-            gl.uniform_1_f32(
-                self.symbol_uniforms.gate_event_count.as_ref(),
-                gate_event_count,
-            );
-            gl.uniform_1_f32(
-                self.symbol_uniforms.animation_speed.as_ref(),
-                config.animation_speed,
-            );
-            gl.uniform_1_f32(
-                self.symbol_uniforms.cycle_speed.as_ref(),
-                config.cycle_speed,
-            );
-            gl.uniform_1_i32(self.symbol_uniforms.loops.as_ref(), 0);
-            self.symbol_triangle.draw(gl);
-            self.symbol_buf.swap();
-
-            // --- effect ---
-            self.effect_buf.write().bind(gl);
-            gl.use_program(Some(self.effect_program));
-            gl.uniform_1_f32(self.effect_uniforms.num_columns.as_ref(), num_columns);
-            gl.uniform_1_f32(self.effect_uniforms.num_rows.as_ref(), num_rows);
-            gl.uniform_1_f32(self.effect_uniforms.time.as_ref(), time);
-            gl.uniform_1_f32(self.effect_uniforms.tick.as_ref(), tick);
-            gl.uniform_1_f32(
-                self.effect_uniforms.animation_speed.as_ref(),
-                config.animation_speed,
-            );
-            gl.uniform_1_i32(
-                self.effect_uniforms.has_thunder.as_ref(),
-                config.has_thunder as i32,
-            );
-            gl.uniform_1_i32(self.effect_uniforms.loops.as_ref(), 0);
-            gl.uniform_1_f32(
-                self.effect_uniforms.glyph_height_to_width.as_ref(),
-                config.glyph_height_to_width,
-            );
-            let ripple_type = match config.ripple_type {
-                None => -1,
-                Some(crate::config::RippleType::Box) => 0,
-                Some(crate::config::RippleType::Circle) => 1,
-            };
-            gl.uniform_1_i32(self.effect_uniforms.ripple_type.as_ref(), ripple_type);
-            gl.uniform_1_f32(
-                self.effect_uniforms.ripple_scale.as_ref(),
-                config.ripple_scale,
-            );
-            gl.uniform_1_f32(
-                self.effect_uniforms.ripple_speed.as_ref(),
-                config.ripple_speed,
-            );
-            gl.uniform_1_f32(
-                self.effect_uniforms.ripple_thickness.as_ref(),
-                config.ripple_thickness,
-            );
-            self.effect_triangle.draw(gl);
-            self.effect_buf.swap();
-
-            gl.bind_texture(glow::TEXTURE_2D, None);
+    /// makes the glyph-cycling gate a no-op — it's always true — so
+    /// without this early return, calling `run` more often than the
+    /// nominal tick rate (e.g. extra repaints `eframe` forces on mouse
+    /// movement) would advance the glyph-cycling `age` accumulator once
+    /// per *call* rather than once per elapsed tick, exactly the bug this
+    /// whole tick-pacing mechanism exists to prevent. Skipping only this
+    /// pass (not the render/bloom/effect passes downstream, which still
+    /// redraw every call) avoids a missing-frame flicker, since unlike the
+    /// original's persistent browser canvas, egui repaints the whole
+    /// window every call and expects a fresh frame back.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        samplers: &Samplers,
+        config: &MatrixConfig,
+        time: f32,
+        glyph_sequence_length: u32,
+    ) {
+        let previous_tick = self.tick;
+        (self.tick, self.last_tick_time) = advance_tick(self.tick, self.last_tick_time, time);
+        if self.tick == previous_tick {
+            return;
         }
+        let ticks_elapsed = self.tick - previous_tick;
+        let gate_event_count =
+            count_gate_events(previous_tick, self.tick, config.cycle_frame_skip) as f32;
+        // `mix(prev, target, decay)` applied once per elapsed tick, N
+        // times in a row, is equivalent to a single
+        // `mix(prev, target, 1 - (1-decay)^N)` (holding the target
+        // constant across the batch — see `count_gate_events`'s doc
+        // comment for the analogous reasoning behind batching ticks in
+        // the first place). This keeps `brightness_decay`'s organic
+        // fade rate correct even when `ticks_elapsed > 1`, without
+        // needing a shader-side loop.
+        let effective_brightness_decay =
+            1.0 - (1.0 - config.brightness_decay).powi(ticks_elapsed as i32);
+        let tick = self.tick as f32;
+        let num_columns = self.num_columns as f32;
+        let num_rows = self.num_rows as f32;
+
+        // --- intro ---
+        let mut u = Uniforms::new();
+        u.f32(time)
+            .f32(tick)
+            .f32(config.animation_speed)
+            .f32(config.fall_speed)
+            .f32(num_columns)
+            .f32(num_rows)
+            .bool(config.skip_intro);
+        self.intro_uniforms.write(queue, u);
+        let bind_group = self.intro_pass.bind_group(
+            device,
+            &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: self.intro_uniforms.binding(),
+            }],
+        );
+        gpu::draw_fullscreen(
+            encoder,
+            &self.intro_target.view,
+            &self.intro_pass,
+            &bind_group,
+        );
+
+        // --- raindrop ---
+        let mut u = Uniforms::new();
+        u.f32(time)
+            .f32(tick)
+            .f32(config.animation_speed)
+            .f32(config.fall_speed)
+            .f32(num_columns)
+            .f32(num_rows)
+            .f32(effective_brightness_decay)
+            .f32(config.raindrop_length)
+            .bool(false)
+            .bool(config.skip_intro);
+        self.raindrop_uniforms.write(queue, u);
+        let bind_group = self.raindrop_pass.bind_group(
+            device,
+            &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.raindrop_uniforms.binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&self.raindrop_buf.read().view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&self.intro_target.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&samplers.nearest),
+                },
+            ],
+        );
+        gpu::draw_fullscreen(
+            encoder,
+            &self.raindrop_buf.write().view,
+            &self.raindrop_pass,
+            &bind_group,
+        );
+        self.raindrop_buf.swap();
+
+        // --- symbol ---
+        let mut u = Uniforms::new();
+        u.f32(time)
+            .f32(tick)
+            .f32(config.cycle_frame_skip as f32)
+            .f32(config.animation_speed)
+            .f32(config.cycle_speed)
+            .f32(gate_event_count)
+            .f32(num_columns)
+            .f32(num_rows)
+            .f32(glyph_sequence_length as f32)
+            .bool(false);
+        self.symbol_uniforms.write(queue, u);
+        let bind_group = self.symbol_pass.bind_group(
+            device,
+            &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.symbol_uniforms.binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&self.symbol_buf.read().view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&self.raindrop_buf.read().view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&samplers.nearest),
+                },
+            ],
+        );
+        gpu::draw_fullscreen(
+            encoder,
+            &self.symbol_buf.write().view,
+            &self.symbol_pass,
+            &bind_group,
+        );
+        self.symbol_buf.swap();
+
+        // --- effect ---
+        let ripple_type = match config.ripple_type {
+            None => -1,
+            Some(RippleType::Box) => 0,
+            Some(RippleType::Circle) => 1,
+        };
+        let mut u = Uniforms::new();
+        u.f32(time)
+            .f32(tick)
+            .f32(config.animation_speed)
+            .f32(num_columns)
+            .f32(num_rows)
+            .f32(config.glyph_height_to_width)
+            .f32(config.ripple_scale)
+            .f32(config.ripple_speed)
+            .f32(config.ripple_thickness)
+            .i32(ripple_type)
+            .bool(config.has_thunder)
+            .bool(false);
+        self.effect_uniforms.write(queue, u);
+        let bind_group = self.effect_pass.bind_group(
+            device,
+            &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: self.effect_uniforms.binding(),
+            }],
+        );
+        gpu::draw_fullscreen(
+            encoder,
+            &self.effect_target.view,
+            &self.effect_pass,
+            &bind_group,
+        );
     }
 
-    pub fn raindrop_state(&self) -> glow::Texture {
-        self.raindrop_buf.read().texture
+    pub fn raindrop_state(&self) -> &wgpu::TextureView {
+        &self.raindrop_buf.read().view
     }
 
-    pub fn symbol_state(&self) -> glow::Texture {
-        self.symbol_buf.read().texture
+    pub fn symbol_state(&self) -> &wgpu::TextureView {
+        &self.symbol_buf.read().view
     }
 
-    pub fn effect_state(&self) -> glow::Texture {
-        self.effect_buf.read().texture
-    }
-
-    pub unsafe fn destroy(&self, gl: &glow::Context) {
-        unsafe {
-            self.intro_buf.destroy(gl);
-            self.raindrop_buf.destroy(gl);
-            self.symbol_buf.destroy(gl);
-            self.effect_buf.destroy(gl);
-            self.intro_triangle.destroy(gl);
-            self.raindrop_triangle.destroy(gl);
-            self.symbol_triangle.destroy(gl);
-            self.effect_triangle.destroy(gl);
-            gl.delete_program(self.intro_program);
-            gl.delete_program(self.raindrop_program);
-            gl.delete_program(self.symbol_program);
-            gl.delete_program(self.effect_program);
-        }
+    pub fn effect_state(&self) -> &wgpu::TextureView {
+        &self.effect_target.view
     }
 }
 
@@ -573,7 +401,7 @@ impl ComputePasses {
 /// since the last advancement (0 for a burst of near-zero-dt extra calls,
 /// 1 for steady nominal-rate calls, more than 1 to catch up after a
 /// stall/lag spike) instead of once per call. This keeps glyph-cycling
-/// (gated on `tick` in `symbol.frag.glsl`) paced by real time rather than
+/// (gated on `tick` in `symbol.wgsl`) paced by real time rather than
 /// by how many times `run()` happens to be invoked — some hosts (e.g.
 /// `eframe`'s native backend) force extra repaints on input events like
 /// mouse movement, which would otherwise make `tick`-gated animation speed
@@ -581,7 +409,7 @@ impl ComputePasses {
 fn advance_tick(tick: u32, last_tick_time: f32, time: f32) -> (u32, f32) {
     if tick == 0 {
         // First call ever: seed tick at 1 unconditionally so `isFirstFrame`
-        // (`tick <= 1.` in raindrop.frag.glsl / symbol.frag.glsl) still
+        // (`tick <= 1.` in raindrop.wgsl / symbol.wgsl) still
         // fires on the true first frame.
         return (1, time);
     }
@@ -601,7 +429,7 @@ fn advance_tick(tick: u32, last_tick_time: f32, time: f32) -> (u32, f32) {
 }
 
 /// Counts how many multiples of `cycle_frame_skip` lie in
-/// `(previous_tick, tick]` — i.e. how many times `symbol.frag.glsl`'s
+/// `(previous_tick, tick]` — i.e. how many times `symbol.wgsl`'s
 /// glyph-cycling gate would have fired had ticks advanced one at a time
 /// instead of being batched by `advance_tick`. Uses the standard "count
 /// multiples of k up to n" identity (`floor(n/k) - floor(m/k)`), so it

@@ -11,7 +11,7 @@
 //! 4x4 matrices" — about as much as `glam` would save isn't worth a new
 //! dependency for.
 
-/// Column-major, matching GLSL's `mat4` layout.
+/// Column-major, matching WGSL's `mat4x4<f32>` layout.
 pub type Mat4 = [f32; 16];
 
 fn mat4_identity() -> Mat4 {
@@ -28,18 +28,20 @@ fn mat4_translation(x: f32, y: f32, z: f32) -> Mat4 {
     m
 }
 
-/// Standard right-handed perspective projection, matching `gl-matrix`'s
+/// Standard right-handed perspective projection, like `gl-matrix`'s
 /// `mat4.perspective` (used by the original via `mat4.perspective(camera,
-/// (Math.PI/180)*90, aspectRatio, 0.0001, 1000)`).
+/// (Math.PI/180)*90, aspectRatio, 0.0001, 1000)`), except that it maps depth
+/// to wgpu's `0..1` clip range instead of GL's `-1..1` (same view volume,
+/// same near/far planes).
 fn mat4_perspective(fovy_radians: f32, aspect: f32, near: f32, far: f32) -> Mat4 {
     let f = 1.0 / (fovy_radians / 2.0).tan();
     let range_inv = 1.0 / (near - far);
     let mut m = [0.0; 16];
     m[0] = f / aspect;
     m[5] = f;
-    m[10] = (near + far) * range_inv;
+    m[10] = far * range_inv;
     m[11] = -1.0;
-    m[14] = 2.0 * near * far * range_inv;
+    m[14] = near * far * range_inv;
     m
 }
 

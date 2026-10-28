@@ -1,6 +1,6 @@
 [package]
 name = "egui-screensaver-matrix"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.95"
 authors = ["Cecile Tonglet <cecile.tonglet@cecton.com>"]
@@ -15,8 +15,7 @@ categories = ["gui", "graphics", "wasm", "visualization"]
 
 [dependencies]
 egui = { version = "0.36", default-features = false }
-egui_glow = "0.36"
-glow = "0.17"
+egui-wgpu = "0.36"
 log = "0.4"
 image = { version = "0.25", default-features = false, features = ["png"] }
 serde = { version = "1", features = ["derive"], optional = true }
@@ -26,15 +25,17 @@ serde = ["dep:serde"]
 
 [dev-dependencies]
 xtask-wasm = { version = "0.6.5", features = ["run-example", "wasm-opt"] }
+env_logger = { version = "0.11", default-features = false }
+pollster = "1"
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
-eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts", "web_screen_reader", "accesskit"] }
+eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts", "web_screen_reader", "accesskit"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = ["HtmlCanvasElement", "Location", "UrlSearchParams", "Window", "console"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11"] }
 
 [workspace]
 members = ["."]

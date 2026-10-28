@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-28
+
+### Changed
+
+- **Breaking:** the renderer moved from `glow` to `wgpu`. Every shader is
+  now WGSL, the offscreen passes run on the encoder egui hands to
+  `egui_wgpu::CallbackTrait::prepare` and the final composite is drawn in
+  egui's render pass, so the host `eframe::App` must use the `wgpu`
+  backend. `MatrixBackground::paint` takes
+  `Option<&egui_wgpu::RenderState>` (from
+  `eframe::Frame::wgpu_render_state()`) instead of
+  `Option<&Arc<glow::Context>>`.
+- The volumetric projection now maps depth to wgpu's `0..1` clip range.
+- The `egui_glow` and `glow` dependencies are gone, along with the
+  RGBA16F-to-RGBA8 render-target fallback (RGBA16F is always renderable
+  under wgpu).
+
+### Added
+
+- Headless `screenshot` example rendering any preset through
+  `egui_wgpu` into a PNG, with no window or compositor.
+
 ## [0.1.3] - 2026-07-05
 
 ### Fixed
@@ -70,7 +92,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   base/glint textures.
 - Native and web (WASM) demo examples.
 
-[Unreleased]: https://github.com/cecton/egui-screensaver-matrix/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/cecton/egui-screensaver-matrix/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/cecton/egui-screensaver-matrix/compare/v0.4.0...v0.5.0
 [0.1.3]: https://github.com/cecton/egui-screensaver-matrix/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/cecton/egui-screensaver-matrix/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/cecton/egui-screensaver-matrix/compare/v0.1.0...v0.1.1

@@ -16,8 +16,8 @@ Like the original, this runs the whole simulation on the GPU: ping-pong
 "compute" render targets drive the falling-glyph animation, an MSDF font
 atlas renders the glyphs, and a bloom pass plus a palette/stripe/pride/trans
 color-effect pass finish the look — all through an [`egui::PaintCallback`]
-via [`egui_glow`]. This means the host `eframe::App` must use the `glow`
-rendering backend (not `wgpu`). All 13 named presets from the original are
+via [`egui_wgpu`]. This means the host `eframe::App` must use the `wgpu`
+rendering backend (not `glow`). All 13 named presets from the original are
 included, plus the 4 volumetric (3D perspective) presets.
 
 ## Demo
@@ -65,7 +65,7 @@ struct MyApp {
 impl eframe::App for MyApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        self.matrix.paint(&ctx, frame.gl());
+        self.matrix.paint(&ctx, frame.wgpu_render_state());
         // … rest of your UI …
     }
 }

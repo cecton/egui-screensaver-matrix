@@ -3,48 +3,24 @@
 //! color sequence (`stripes`/`pride`/`trans`), ported from
 //! `js/regl/palettePass.js` / `js/regl/stripePass.js` and
 //! `shaders/glsl/palettePass.frag.glsl` / `shaders/glsl/stripePass.frag.glsl`
-//! at https://github.com/Rezmason/matrix (MIT licensed).
+//! at https://github.com/Rezmason/matrix (MIT licensed). Unlike every
+//! other pass, this one is drawn straight into egui's own render pass (see
+//! `lib.rs`), so it is split into `prepare` (uniforms and bind group) and
+//! `paint` (the draw call).
 
-use std::sync::Arc;
-
-use glow::HasContext as _;
+use egui_wgpu::wgpu;
 
 use crate::config::{Effect, MatrixConfig, PaletteStop};
-use crate::gl_util::{self, FullscreenTriangle};
+use crate::gpu::{self, PassPipeline, Samplers, UniformBuffer, Uniforms};
 
-const FULLSCREEN_VERT_SRC: &str = include_str!("../shaders/fullscreen.vert.glsl");
-const PALETTE_FRAG_SRC: &str = include_str!("../shaders/palette.frag.glsl");
-const STRIPES_FRAG_SRC: &str = include_str!("../shaders/stripes.frag.glsl");
+const PALETTE_SRC: &str = include_str!("../shaders/palette.wgsl");
 
 /// Resolution of the generated palette gradient texture, matching the
 /// original's `PALETTE_SIZE`.
 const PALETTE_SIZE: usize = 2048;
 
-struct PaletteUniforms {
-    tex: Option<glow::UniformLocation>,
-    bloom_tex: Option<glow::UniformLocation>,
-    palette_tex: Option<glow::UniformLocation>,
-    dither_magnitude: Option<glow::UniformLocation>,
-    time: Option<glow::UniformLocation>,
-    background_color: Option<glow::UniformLocation>,
-    cursor_color: Option<glow::UniformLocation>,
-    glint_color: Option<glow::UniformLocation>,
-    cursor_intensity: Option<glow::UniformLocation>,
-    glint_intensity: Option<glow::UniformLocation>,
-}
-
-struct StripesUniforms {
-    tex: Option<glow::UniformLocation>,
-    bloom_tex: Option<glow::UniformLocation>,
-    stripe_tex: Option<glow::UniformLocation>,
-    dither_magnitude: Option<glow::UniformLocation>,
-    time: Option<glow::UniformLocation>,
-    background_color: Option<glow::UniformLocation>,
-    cursor_color: Option<glow::UniformLocation>,
-    glint_color: Option<glow::UniformLocation>,
-    cursor_intensity: Option<glow::UniformLocation>,
-    glint_intensity: Option<glow::UniformLocation>,
-}
+/// Size in bytes of the `Params` uniform block in `palette.wgsl`.
+const UNIFORM_SIZE: u64 = 64;
 
 /// Builds the `PALETTE_SIZE`-texel 1D gradient texture from a set of
 /// (possibly unsorted) color stops, ported from `palettePass.js`'s
@@ -107,47 +83,21 @@ fn build_stripe_rgba(colors: &[[f32; 3]]) -> Vec<u8> {
     rgba
 }
 
-unsafe fn upload_1d_rgba(
-    gl: &glow::Context,
-    rgba: &[u8],
-    width: i32,
-) -> Result<glow::Texture, String> {
-    unsafe {
-        let texture = gl.create_texture()?;
-        gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-        gl.tex_parameter_i32(
-            glow::TEXTURE_2D,
-            glow::TEXTURE_WRAP_S,
-            glow::CLAMP_TO_EDGE as i32,
-        );
-        gl.tex_parameter_i32(
-            glow::TEXTURE_2D,
-            glow::TEXTURE_WRAP_T,
-            glow::CLAMP_TO_EDGE as i32,
-        );
-        gl.tex_parameter_i32(
-            glow::TEXTURE_2D,
-            glow::TEXTURE_MIN_FILTER,
-            glow::LINEAR as i32,
-        );
-        gl.tex_parameter_i32(
-            glow::TEXTURE_2D,
-            glow::TEXTURE_MAG_FILTER,
-            glow::LINEAR as i32,
-        );
-        gl.tex_image_2d(
-            glow::TEXTURE_2D,
-            0,
-            glow::RGBA8 as i32,
-            width,
-            1,
-            0,
-            glow::RGBA,
-            glow::UNSIGNED_BYTE,
-            glow::PixelUnpackData::Slice(Some(rgba)),
-        );
-        gl.bind_texture(glow::TEXTURE_2D, None);
-        Ok(texture)
+/// A 1-texel-tall RGBA8 lookup texture (palette gradient or stripe
+/// sequence).
+struct ColorTexture {
+    _texture: wgpu::Texture,
+    view: wgpu::TextureView,
+}
+
+impl ColorTexture {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue, rgba: &[u8], width: usize) -> Self {
+        let texture = gpu::upload_rgba(device, queue, rgba, width as u32, 1);
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        Self {
+            _texture: texture,
+            view,
+        }
     }
 }
 
@@ -161,232 +111,173 @@ fn stripe_colors_for(effect: &Effect) -> Option<Vec<[f32; 3]>> {
 }
 
 pub struct EffectPasses {
-    palette_program: glow::Program,
-    palette_triangle: FullscreenTriangle,
-    palette_uniforms: PaletteUniforms,
+    palette_pass: PassPipeline,
+    stripes_pass: PassPipeline,
+    uniforms: UniformBuffer,
 
-    stripes_program: glow::Program,
-    stripes_triangle: FullscreenTriangle,
-    stripes_uniforms: StripesUniforms,
-
-    palette_texture: glow::Texture,
+    palette_texture: ColorTexture,
     built_palette: Vec<PaletteStop>,
-    stripe_texture: glow::Texture,
+    stripe_texture: ColorTexture,
     built_stripes: Vec<[f32; 3]>,
+
+    /// Built by `prepare`, drawn by `paint`.
+    draw: Option<(bool, wgpu::BindGroup)>,
 }
 
 impl EffectPasses {
-    pub unsafe fn new(
-        gl: &Arc<glow::Context>,
-        header: &str,
+    pub fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        target_format: wgpu::TextureFormat,
         config: &MatrixConfig,
-    ) -> Result<Self, String> {
-        unsafe {
-            let palette_program =
-                gl_util::compile_program(gl, header, FULLSCREEN_VERT_SRC, PALETTE_FRAG_SRC)?;
-            let palette_triangle = FullscreenTriangle::new(gl, palette_program)?;
-            let palette_uniforms = PaletteUniforms {
-                tex: gl.get_uniform_location(palette_program, "tex"),
-                bloom_tex: gl.get_uniform_location(palette_program, "bloomTex"),
-                palette_tex: gl.get_uniform_location(palette_program, "paletteTex"),
-                dither_magnitude: gl.get_uniform_location(palette_program, "ditherMagnitude"),
-                time: gl.get_uniform_location(palette_program, "time"),
-                background_color: gl.get_uniform_location(palette_program, "backgroundColor"),
-                cursor_color: gl.get_uniform_location(palette_program, "cursorColor"),
-                glint_color: gl.get_uniform_location(palette_program, "glintColor"),
-                cursor_intensity: gl.get_uniform_location(palette_program, "cursorIntensity"),
-                glint_intensity: gl.get_uniform_location(palette_program, "glintIntensity"),
-            };
+    ) -> Self {
+        let module = gpu::shader_module(device, "matrix palette", PALETTE_SRC);
+        let fragment = wgpu::ShaderStages::FRAGMENT;
+        let entries = [
+            gpu::uniform_entry(0, fragment),
+            gpu::texture_entry(1, fragment),
+            gpu::texture_entry(2, fragment),
+            gpu::texture_entry(3, fragment),
+            gpu::sampler_entry(4, fragment),
+        ];
+        let make = |fragment_entry| {
+            PassPipeline::new(
+                device,
+                "matrix palette",
+                &module,
+                "vs_screen",
+                fragment_entry,
+                &entries,
+                &[],
+                target_format,
+                Some(wgpu::BlendState::REPLACE),
+            )
+        };
 
-            let stripes_program =
-                gl_util::compile_program(gl, header, FULLSCREEN_VERT_SRC, STRIPES_FRAG_SRC)?;
-            let stripes_triangle = FullscreenTriangle::new(gl, stripes_program)?;
-            let stripes_uniforms = StripesUniforms {
-                tex: gl.get_uniform_location(stripes_program, "tex"),
-                bloom_tex: gl.get_uniform_location(stripes_program, "bloomTex"),
-                stripe_tex: gl.get_uniform_location(stripes_program, "stripeTex"),
-                dither_magnitude: gl.get_uniform_location(stripes_program, "ditherMagnitude"),
-                time: gl.get_uniform_location(stripes_program, "time"),
-                background_color: gl.get_uniform_location(stripes_program, "backgroundColor"),
-                cursor_color: gl.get_uniform_location(stripes_program, "cursorColor"),
-                glint_color: gl.get_uniform_location(stripes_program, "glintColor"),
-                cursor_intensity: gl.get_uniform_location(stripes_program, "cursorIntensity"),
-                glint_intensity: gl.get_uniform_location(stripes_program, "glintIntensity"),
-            };
+        let built_palette = match &config.effect {
+            Effect::Palette(stops) => stops.clone(),
+            _ => vec![PaletteStop {
+                color: [0.0, 1.0, 0.0],
+                at: 1.0,
+            }],
+        };
+        let palette_texture = ColorTexture::new(
+            device,
+            queue,
+            &build_palette_rgba(&built_palette),
+            PALETTE_SIZE,
+        );
 
-            let built_palette = match &config.effect {
-                Effect::Palette(stops) => stops.clone(),
-                _ => vec![PaletteStop {
-                    color: [0.0, 1.0, 0.0],
-                    at: 1.0,
-                }],
-            };
-            let palette_texture =
-                upload_1d_rgba(gl, &build_palette_rgba(&built_palette), PALETTE_SIZE as i32)?;
+        let built_stripes =
+            stripe_colors_for(&config.effect).unwrap_or_else(|| vec![[0.0, 1.0, 0.0]]);
+        let stripe_texture = ColorTexture::new(
+            device,
+            queue,
+            &build_stripe_rgba(&built_stripes),
+            built_stripes.len(),
+        );
 
-            let built_stripes =
-                stripe_colors_for(&config.effect).unwrap_or_else(|| vec![[0.0, 1.0, 0.0]]);
-            let stripe_texture = upload_1d_rgba(
-                gl,
-                &build_stripe_rgba(&built_stripes),
-                built_stripes.len() as i32,
-            )?;
-
-            Ok(Self {
-                palette_program,
-                palette_triangle,
-                palette_uniforms,
-                stripes_program,
-                stripes_triangle,
-                stripes_uniforms,
-                palette_texture,
-                built_palette,
-                stripe_texture,
-                built_stripes,
-            })
+        Self {
+            palette_pass: make("fs_palette"),
+            stripes_pass: make("fs_stripes"),
+            uniforms: UniformBuffer::new(device, "matrix palette", UNIFORM_SIZE),
+            palette_texture,
+            built_palette,
+            stripe_texture,
+            built_stripes,
+            draw: None,
         }
     }
 
-    unsafe fn sync_textures(&mut self, gl: &glow::Context, effect: &Effect) {
-        unsafe {
-            if let Effect::Palette(stops) = effect
-                && stops.as_slice() != self.built_palette.as_slice()
-            {
-                gl.delete_texture(self.palette_texture);
-                self.palette_texture =
-                    upload_1d_rgba(gl, &build_palette_rgba(stops), PALETTE_SIZE as i32)
-                        .expect("rebuilding the palette texture should not fail");
-                self.built_palette = stops.clone();
-            }
+    fn sync_textures(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, effect: &Effect) {
+        if let Effect::Palette(stops) = effect
+            && stops.as_slice() != self.built_palette.as_slice()
+        {
+            self.palette_texture =
+                ColorTexture::new(device, queue, &build_palette_rgba(stops), PALETTE_SIZE);
+            self.built_palette = stops.clone();
+        }
 
-            if let Some(colors) = stripe_colors_for(effect)
-                && colors != self.built_stripes
-            {
-                gl.delete_texture(self.stripe_texture);
-                self.stripe_texture =
-                    upload_1d_rgba(gl, &build_stripe_rgba(&colors), colors.len() as i32)
-                        .expect("rebuilding the stripe texture should not fail");
-                self.built_stripes = colors;
-            }
+        if let Some(colors) = stripe_colors_for(effect)
+            && colors != self.built_stripes
+        {
+            self.stripe_texture =
+                ColorTexture::new(device, queue, &build_stripe_rgba(&colors), colors.len());
+            self.built_stripes = colors;
         }
     }
 
-    /// Draws the final composited image into whatever framebuffer is
-    /// currently bound.
-    pub unsafe fn run(
+    /// Writes this frame's uniforms and builds the bind group `paint` will
+    /// draw with.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare(
         &mut self,
-        gl: &glow::Context,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        samplers: &Samplers,
         config: &MatrixConfig,
         time: f32,
-        primary: glow::Texture,
-        bloom: glow::Texture,
+        primary: &wgpu::TextureView,
+        bloom: &wgpu::TextureView,
     ) {
-        unsafe {
-            self.sync_textures(gl, &config.effect);
+        self.sync_textures(device, queue, &config.effect);
 
-            gl.disable(glow::SCISSOR_TEST);
-            gl.disable(glow::BLEND);
+        let mut u = Uniforms::new();
+        u.f32(config.dither_magnitude)
+            .f32(time)
+            .f32(config.cursor_intensity)
+            .f32(config.glint_intensity)
+            .vec3(config.background_color)
+            .vec3(config.cursor_color)
+            .vec3(config.glint_color);
+        self.uniforms.write(queue, u);
 
-            gl.active_texture(glow::TEXTURE0);
-            gl.bind_texture(glow::TEXTURE_2D, Some(primary));
-            gl.active_texture(glow::TEXTURE1);
-            gl.bind_texture(glow::TEXTURE_2D, Some(bloom));
-
-            match &config.effect {
-                Effect::Palette(_) => {
-                    gl.active_texture(glow::TEXTURE2);
-                    gl.bind_texture(glow::TEXTURE_2D, Some(self.palette_texture));
-                    gl.use_program(Some(self.palette_program));
-                    gl.uniform_1_i32(self.palette_uniforms.tex.as_ref(), 0);
-                    gl.uniform_1_i32(self.palette_uniforms.bloom_tex.as_ref(), 1);
-                    gl.uniform_1_i32(self.palette_uniforms.palette_tex.as_ref(), 2);
-                    gl.uniform_1_f32(
-                        self.palette_uniforms.dither_magnitude.as_ref(),
-                        config.dither_magnitude,
-                    );
-                    gl.uniform_1_f32(self.palette_uniforms.time.as_ref(), time);
-                    gl.uniform_3_f32(
-                        self.palette_uniforms.background_color.as_ref(),
-                        config.background_color[0],
-                        config.background_color[1],
-                        config.background_color[2],
-                    );
-                    gl.uniform_3_f32(
-                        self.palette_uniforms.cursor_color.as_ref(),
-                        config.cursor_color[0],
-                        config.cursor_color[1],
-                        config.cursor_color[2],
-                    );
-                    gl.uniform_3_f32(
-                        self.palette_uniforms.glint_color.as_ref(),
-                        config.glint_color[0],
-                        config.glint_color[1],
-                        config.glint_color[2],
-                    );
-                    gl.uniform_1_f32(
-                        self.palette_uniforms.cursor_intensity.as_ref(),
-                        config.cursor_intensity,
-                    );
-                    gl.uniform_1_f32(
-                        self.palette_uniforms.glint_intensity.as_ref(),
-                        config.glint_intensity,
-                    );
-                    self.palette_triangle.draw(gl);
-                }
-                Effect::Stripes(_) | Effect::Pride | Effect::Trans => {
-                    gl.active_texture(glow::TEXTURE2);
-                    gl.bind_texture(glow::TEXTURE_2D, Some(self.stripe_texture));
-                    gl.use_program(Some(self.stripes_program));
-                    gl.uniform_1_i32(self.stripes_uniforms.tex.as_ref(), 0);
-                    gl.uniform_1_i32(self.stripes_uniforms.bloom_tex.as_ref(), 1);
-                    gl.uniform_1_i32(self.stripes_uniforms.stripe_tex.as_ref(), 2);
-                    gl.uniform_1_f32(
-                        self.stripes_uniforms.dither_magnitude.as_ref(),
-                        config.dither_magnitude,
-                    );
-                    gl.uniform_1_f32(self.stripes_uniforms.time.as_ref(), time);
-                    gl.uniform_3_f32(
-                        self.stripes_uniforms.background_color.as_ref(),
-                        config.background_color[0],
-                        config.background_color[1],
-                        config.background_color[2],
-                    );
-                    gl.uniform_3_f32(
-                        self.stripes_uniforms.cursor_color.as_ref(),
-                        config.cursor_color[0],
-                        config.cursor_color[1],
-                        config.cursor_color[2],
-                    );
-                    gl.uniform_3_f32(
-                        self.stripes_uniforms.glint_color.as_ref(),
-                        config.glint_color[0],
-                        config.glint_color[1],
-                        config.glint_color[2],
-                    );
-                    gl.uniform_1_f32(
-                        self.stripes_uniforms.cursor_intensity.as_ref(),
-                        config.cursor_intensity,
-                    );
-                    gl.uniform_1_f32(
-                        self.stripes_uniforms.glint_intensity.as_ref(),
-                        config.glint_intensity,
-                    );
-                    self.stripes_triangle.draw(gl);
-                }
-            }
-
-            gl.bind_texture(glow::TEXTURE_2D, None);
-        }
+        let is_palette = matches!(config.effect, Effect::Palette(_));
+        let (pass, color) = if is_palette {
+            (&self.palette_pass, &self.palette_texture)
+        } else {
+            (&self.stripes_pass, &self.stripe_texture)
+        };
+        let group = pass.bind_group(
+            device,
+            &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.uniforms.binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(primary),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(bloom),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&color.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&samplers.linear),
+                },
+            ],
+        );
+        self.draw = Some((is_palette, group));
     }
 
-    pub unsafe fn destroy(&self, gl: &glow::Context) {
-        unsafe {
-            self.palette_triangle.destroy(gl);
-            self.stripes_triangle.destroy(gl);
-            gl.delete_program(self.palette_program);
-            gl.delete_program(self.stripes_program);
-            gl.delete_texture(self.palette_texture);
-            gl.delete_texture(self.stripe_texture);
-        }
+    /// Draws the final composited image into egui's render pass.
+    pub fn paint(&self, render_pass: &mut wgpu::RenderPass<'static>) {
+        let Some((is_palette, group)) = &self.draw else {
+            return;
+        };
+        let pass = if *is_palette {
+            &self.palette_pass
+        } else {
+            &self.stripes_pass
+        };
+        render_pass.set_pipeline(&pass.pipeline);
+        render_pass.set_bind_group(0, group, &[]);
+        render_pass.draw(0..3, 0..1);
     }
 }

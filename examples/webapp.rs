@@ -63,11 +63,11 @@ impl eframe::App for DemoApp {
             self.logged_first_frame = true;
             let rect = ctx.viewport_rect();
             log::info!(
-                "egui-screensaver-matrix demo: first frame, viewport={rect:?} gl={}",
-                frame.gl().is_some(),
+                "egui-screensaver-matrix demo: first frame, viewport={rect:?} wgpu={}",
+                frame.wgpu_render_state().is_some(),
             );
         }
-        self.screensaver.paint(&ctx, frame.gl());
+        self.screensaver.paint(&ctx, frame.wgpu_render_state());
     }
 }
 
