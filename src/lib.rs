@@ -51,7 +51,13 @@ pub use config::{Effect, MatrixConfig, PaletteStop, Preset, RippleType};
 pub use fonts::FontId;
 pub use textures::DecorativeTexture;
 
-const REPAINT_MS: u64 = 33;
+/// How often the animation is meant to advance, in milliseconds. Also the
+/// minimum spacing between two genuinely re-rendered frames: a repaint that
+/// arrives sooner than this (the host app's own timers interleave with
+/// `request_repaint_after`, so it renders at whatever rate its widgets and
+/// the compositor ask for) re-draws the previous frame instead of running
+/// the whole offscreen chain again — see `Passes::prepare`.
+pub(crate) const REPAINT_MS: u64 = 33;
 
 /// Matrix screensaver state.
 ///

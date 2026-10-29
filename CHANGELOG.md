@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-29
+
+### Fixed
+
+- A repaint that arrives less than one animation tick (`REPAINT_MS`) after
+  the last one now re-draws the previous frame instead of re-running the
+  whole offscreen chain. The animation only advances once per tick, while
+  hosts repaint at whatever rate their own timers and the compositor ask
+  for — commonly ~60 fps, i.e. twice per tick — so roughly half of the
+  per-frame GPU and main-thread CPU work was producing an image identical
+  to the one already on screen. A resize, a `bloom_size` change, a font
+  switch, or a host clock that restarts all force an unconditional
+  re-record, so the cached frame can never be shown stale.
+
 ## [0.5.0] - 2026-10-28
 
 ### Changed
