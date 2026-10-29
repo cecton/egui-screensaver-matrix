@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-10-29
+
+### Fixed
+
+- Frames are now binned into fixed `REPAINT_MS`-wide buckets of animation
+  time, and only the first frame of each bucket re-runs the offscreen
+  chain, instead of recording whenever 3/4 of a tick had passed since the
+  last record. That relaxation existed to survive the host's timer jitter,
+  but it also admitted a host repainting every ~8 ms (which pointer motion
+  causes, since every mouse event wakes egui's loop), making the chain run
+  about 40 times a second instead of 30. Because every pass animates from
+  the `time` value directly, that visibly sped the animation up while the
+  pointer moved. The record rate is now the tick rate whatever the host
+  does above it, on an even cadence.
+
 ## [0.5.1] - 2026-10-29
 
 ### Fixed

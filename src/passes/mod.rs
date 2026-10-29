@@ -28,29 +28,55 @@ fn grid_dimensions(config: &MatrixConfig) -> (u32, u32) {
     }
 }
 
-/// Minimum spacing between two recorded frames, in seconds: the animation
-/// only advances once per [`crate::REPAINT_MS`], so anything sooner would
-/// rebuild the same image.
-///
-/// Relaxed to 3/4 of a tick because the host's repaint timer does not land
-/// exactly on the nominal interval: a host already running at the tick rate
-/// delivers frames slightly early as often as slightly late, and a strict
-/// comparison would skip every other one and halve the animation to 15 fps.
-/// 3/4 still skips the second frame of a host that renders twice per tick.
-const RECORD_INTERVAL_SECS: f32 = crate::REPAINT_MS as f32 / 1000.0 * 0.75;
+/// Width of one record bucket, in seconds: the animation only advances once
+/// per [`crate::REPAINT_MS`].
+const RECORD_INTERVAL_SECS: f32 = crate::REPAINT_MS as f32 / 1000.0;
 
-/// Whether a frame painted at `time` should re-record the offscreen chain,
-/// given the `time` of the last frame that did (`None` before the first).
+/// Decides which frames re-run the offscreen chain, given the animation
+/// `time` each repaint reports.
 ///
-/// Left un-skipped for a non-positive elapsed time: that means the host's
-/// clock restarted (a fresh `egui::Context` starts `time` over at zero), so
-/// recording — rather than trusting an image from an older clock — keeps a
-/// cached frame from going stale forever.
-fn should_record(last_recorded_at: Option<f32>, time: f32) -> bool {
-    let Some(last) = last_recorded_at else {
-        return true;
-    };
-    !(0.0..RECORD_INTERVAL_SECS).contains(&(time - last))
+/// The animation only needs a new image once per [`RECORD_INTERVAL_SECS`],
+/// while the host repaints at whatever rate its own timers and the
+/// compositor ask for: ~60 fps normally, but faster whenever egui has been
+/// asked to repaint for something else — pointer motion is the big one,
+/// since every mouse event wakes the loop.
+///
+/// Frames are therefore binned into fixed [`RECORD_INTERVAL_SECS`] buckets
+/// of animation time, and only the first frame of each bucket records. That
+/// caps the chain at one run per tick whatever the host does above it, and
+/// keeps the runs on an even cadence. A "one interval since the last
+/// record" test can do neither: it has to be relaxed below the nominal
+/// interval to survive the host's timer jitter (a host at exactly the tick
+/// rate delivers frames slightly early as often as slightly late), and the
+/// relaxation then also admits a host repainting every 8 ms — which records
+/// several times per tick. Those extra runs are not neutral here: every
+/// pass animates from `time` directly, so the picture would update ~40
+/// rather than 30 times a second on pointer motion.
+#[derive(Default)]
+struct RecordGate {
+    /// Index of the bucket the last recorded frame fell in.
+    last_bucket: Option<i64>,
+}
+
+impl RecordGate {
+    /// Records on the next call whatever the bucket says — for anything
+    /// that invalidates the cached image outright (a resize, a font switch,
+    /// a recreated target).
+    fn force(&mut self) {
+        self.last_bucket = None;
+    }
+
+    fn should_record(&mut self, time: f32) -> bool {
+        // The bucket an absolute `time` falls in. Quantising the *animation*
+        // clock rather than measuring gaps between records is what makes the
+        // rate independent of how often the host repaints.
+        let bucket = (f64::from(time) / f64::from(RECORD_INTERVAL_SECS)).floor() as i64;
+        if self.last_bucket == Some(bucket) {
+            return false;
+        }
+        self.last_bucket = Some(bucket);
+        true
+    }
 }
 
 /// Owns every GPU resource for one frame's worth of work: the compute
@@ -73,12 +99,8 @@ pub struct Passes {
     screen_width: u32,
     screen_height: u32,
     bloom_size: f32,
-    /// The `time` value of the last frame that recorded offscreen work, or
-    /// `None` before the first one. [`Passes::prepare`] skips the whole
-    /// offscreen chain while less than one [`crate::REPAINT_MS`] has
-    /// elapsed since this, since the image such a frame would produce is
-    /// the one already sitting in the targets.
-    last_recorded_at: Option<f32>,
+    /// Decides which frames actually re-run the offscreen chain.
+    gate: RecordGate,
 }
 
 impl Passes {
@@ -119,7 +141,7 @@ impl Passes {
             screen_width,
             screen_height,
             bloom_size: config.bloom_size,
-            last_recorded_at: None,
+            gate: RecordGate::default(),
         })
     }
 
@@ -134,7 +156,7 @@ impl Passes {
     /// around 60 fps, i.e. twice per tick, which would otherwise run this
     /// ~10-pass chain twice per image with nothing to show for it. Anything
     /// that invalidates the cached image (a resize, a new bloom size, a font
-    /// switch) clears `last_recorded_at` so the next call always records.
+    /// switch) calls [`RecordGate::force`] so the next call always records.
     pub fn prepare(
         &mut self,
         device: &wgpu::Device,
@@ -151,7 +173,7 @@ impl Passes {
             self.grid_rows = grid_rows;
             // The ping-pong state was just thrown away; the cached image is
             // stale regardless of how long ago it was recorded.
-            self.last_recorded_at = None;
+            self.gate.force();
         }
 
         if config.font != self.current_font {
@@ -167,7 +189,7 @@ impl Passes {
                 // re-roll now instead. See `reset_tick`'s doc comment.
                 self.compute.reset_tick();
                 self.current_font = config.font;
-                self.last_recorded_at = None;
+                self.gate.force();
             }
         }
 
@@ -191,13 +213,12 @@ impl Passes {
             self.bloom_size = config.bloom_size;
             // Fresh (cleared) targets and a bind group still pointing at the
             // old views: record unconditionally this frame.
-            self.last_recorded_at = None;
+            self.gate.force();
         }
 
-        if !should_record(self.last_recorded_at, time) {
+        if !self.gate.should_record(time) {
             return;
         }
-        self.last_recorded_at = Some(time);
 
         self.compute.run(
             device,
@@ -249,40 +270,117 @@ impl Passes {
 
 #[cfg(test)]
 mod tests {
-    use super::should_record;
+    use super::{RECORD_INTERVAL_SECS, RecordGate};
 
-    /// The whole point of the skip: a repaint that lands less than one tick
-    /// after the last recorded frame must not re-run the offscreen chain.
-    #[test]
-    fn frame_one_frame_after_a_recorded_one_is_skipped() {
-        // Two frames of a 60 fps host, against a 33 ms tick.
-        assert!(!should_record(Some(0.0), 0.016));
-        assert!(!should_record(Some(0.016), 0.032));
+    /// Drives the gate with a host repainting every `cadence` seconds for
+    /// `seconds`, returning the times that recorded.
+    fn drive(cadence: f64, seconds: f64, jitter: f64) -> Vec<f64> {
+        let mut gate = RecordGate::default();
+        let mut t = 0.0;
+        let mut records = Vec::new();
+        let mut i = 0.0f64;
+        while t < seconds {
+            if gate.should_record(t as f32) {
+                records.push(t);
+            }
+            i += 1.0;
+            t += cadence + jitter * (i * 1.7).sin();
+        }
+        records
     }
 
-    #[test]
-    fn first_frame_always_records() {
-        assert!(should_record(None, 0.0));
-        assert!(should_record(None, 12.5));
+    fn tick_rate() -> f64 {
+        1.0 / f64::from(RECORD_INTERVAL_SECS)
     }
 
-    #[test]
-    fn a_full_tick_or_more_records() {
-        assert!(should_record(Some(0.0), 0.033));
-        assert!(should_record(Some(0.0), 0.05));
-        // A stalled host catches up rather than staying frozen.
-        assert!(should_record(Some(0.0), 30.0));
+    fn rate(cadence: f64, seconds: f64, jitter: f64) -> f64 {
+        drive(cadence, seconds, jitter).len() as f64 / seconds
     }
 
-    /// A clock that stands still skips (the animation's own time comes from
-    /// that clock, so it has not advanced either), but a clock that goes
-    /// *backwards* — `egui::Context::default()` starts `time` over at zero —
-    /// records, so an image drawn against the old clock can never be trusted
-    /// as current forever.
+    /// The whole point: however fast the host repaints above the tick rate,
+    /// the chain runs at the tick rate and no faster. Every pass animates
+    /// from `time` directly, so running it more often would visibly speed
+    /// the animation up — which is exactly what pointer motion does to a
+    /// host that repaints on every mouse event.
     #[test]
-    fn a_still_clock_skips_but_a_restarted_one_records() {
-        assert!(!should_record(Some(5.0), 5.0));
-        assert!(should_record(Some(5.0), 0.0));
-        assert!(should_record(Some(5.0), -1.0));
+    fn any_fast_host_records_at_the_tick_rate() {
+        for fps in [60.0, 61.0, 75.0, 90.0, 120.0, 144.0, 165.0, 240.0] {
+            let got = rate(1.0 / fps, 20.0, 0.0);
+            assert!(
+                (got - tick_rate()).abs() < 1.0,
+                "host at {fps} fps recorded {got}/s, expected ~{}/s",
+                tick_rate()
+            );
+        }
+    }
+
+    /// A host slower than the tick rate records every frame: there is
+    /// nothing to skip.
+    #[test]
+    fn a_slow_host_records_every_frame() {
+        for fps in [30.0, 25.0, 24.0, 20.0, 15.0] {
+            let got = rate(1.0 / fps, 20.0, 0.0);
+            assert!(
+                (got - fps).abs() < 0.5,
+                "host at {fps} fps recorded {got}/s, expected {fps}/s"
+            );
+        }
+    }
+
+    /// The rate holds under the host's timer jitter, which is what the
+    /// bucket boundaries make free: a frame that arrives a millisecond
+    /// either side of a boundary lands in whichever bucket it lands in.
+    #[test]
+    fn the_rate_holds_under_jitter() {
+        for (fps, jitter) in [(60.0, 0.0), (61.0, 0.0006), (144.0, 0.0006)] {
+            let got = rate(1.0 / fps, 20.0, jitter);
+            assert!(
+                (got - tick_rate()).abs() < 1.0,
+                "host at {fps} fps recorded {got}/s, expected ~{}/s",
+                tick_rate()
+            );
+        }
+    }
+
+    /// Two repaints inside the same tick record once, not twice. This is the
+    /// regression the gate exists to prevent.
+    #[test]
+    fn two_repaints_inside_one_tick_record_once() {
+        let mut gate = RecordGate::default();
+        let tick = RECORD_INTERVAL_SECS;
+        assert!(gate.should_record(0.0));
+        // An 8 ms host: several repaints before the next tick boundary.
+        assert!(!gate.should_record(tick * 0.25));
+        assert!(!gate.should_record(tick * 0.5));
+        assert!(!gate.should_record(tick * 0.75));
+        assert!(gate.should_record(tick * 1.01));
+    }
+
+    /// The first frame records whenever it arrives.
+    #[test]
+    fn the_first_frame_always_records() {
+        let mut gate = RecordGate::default();
+        assert!(gate.should_record(12.5));
+        assert!(!gate.should_record(12.5 + RECORD_INTERVAL_SECS * 0.2));
+    }
+
+    /// A stall of several ticks records once on return, then carries on.
+    #[test]
+    fn a_stall_records_once() {
+        let mut gate = RecordGate::default();
+        assert!(gate.should_record(0.0));
+        assert!(gate.should_record(1.0));
+        assert!(!gate.should_record(1.0 + RECORD_INTERVAL_SECS * 0.2));
+    }
+
+    /// `force` (a resize, a font switch) makes the very next frame record
+    /// even though its bucket has already been recorded.
+    #[test]
+    fn force_records_the_next_frame() {
+        let mut gate = RecordGate::default();
+        assert!(gate.should_record(0.0));
+        assert!(!gate.should_record(0.01));
+        gate.force();
+        assert!(gate.should_record(0.011));
     }
 }
